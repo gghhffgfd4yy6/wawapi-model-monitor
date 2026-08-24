@@ -15,6 +15,7 @@
     "test:app": "node test_app_p.js",
     "test:app:serial": "node test_app.js",
     "test:notify": "node test_notify.js",
+    "test:model-monitor": "node test_wawapi_model_monitor.js",
     "test:lazy": "node test_lazy_notify.js",
     "test:loop": "node test_loop.js",
     "test:failure-policy": "node test_failure_policy.js",

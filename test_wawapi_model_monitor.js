@@ -391,6 +391,50 @@ async function test (name, fn) {
     assert.equal(calls, 2)
   })
 
+  await test('关注列表只标记重点，不过滤其他模型变化', async () => {
+    const store = makeStateStore({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: '2026-08-25T00:00:00.000Z',
+      lastStatus: 'healthy',
+      activeIncident: null
+    })
+    const notices = []
+    const result = await monitorOnce({
+      readState: store.read,
+      writeState: store.write,
+      fetchModels: async () => jsonResponse(['model-a', 'claude-opus-4']),
+      notify: async (title, body) => notices.push({ title, body }),
+      watch: { watchExact: ['claude-opus-4'], watchPrefixes: ['gpt-'] },
+      now: () => new Date('2026-08-25T00:05:00.000Z')
+    })
+    assert.deepEqual(result.added, ['claude-opus-4'])
+    assert.match(notices[0].body, /⭐/)
+  })
+
+  await test('report-current 在无变化时仍发送当前列表', async () => {
+    const store = makeStateStore({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: '2026-08-25T00:00:00.000Z',
+      lastStatus: 'healthy',
+      activeIncident: null
+    })
+    const notices = []
+    const result = await monitorOnce({
+      readState: store.read,
+      writeState: store.write,
+      fetchModels: async () => jsonResponse(['model-a']),
+      notify: async (title, body) => notices.push({ title, body }),
+      reportCurrent: true,
+      now: () => new Date('2026-08-25T00:05:00.000Z')
+    })
+    assert.equal(result.outcome, 'reported')
+    assert.equal(notices.length, 1)
+    assert.match(notices[0].title, /当前模型列表/)
+    assert.match(notices[0].body, /model-a/)
+  })
+
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)
   if (failed > 0) process.exitCode = 1
 })()

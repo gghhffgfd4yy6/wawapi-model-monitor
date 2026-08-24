@@ -68,6 +68,43 @@ Config.storage.minFreeBytes // 磁盘余量告警阈值（只告警，不阻断�
 
 ---
 
+### `wawapi_model_monitor_core.js` — WawAPI 模型监测核心
+
+**定位**:独立模型目录监测的纯逻辑模块，不直接访问网络、文件或通知渠道。
+
+**职责**:
+- 解析和校验 `/v1/models` 的 `data[].id`；
+- 对相邻有效模型快照计算上新和下架；
+- 管理 `healthy`、空列表和 API 异常状态；
+- 生成模型变更、空列表、API 异常和恢复通知正文；
+- 支持精确模型 ID 和前缀关注标记。
+
+空列表和 API 异常不会清空上一份非空快照；核心通过依赖注入接受状态读写、HTTP 和通知函数，测试不访问真实 WawAPI。
+
+### `wawapi_model_monitor.js` — WawAPI 监测运行入口
+
+**定位**:独立 CLI，连接 WawAPI、状态文件和现有通知模块。
+
+**入口**:
+```bash
+node wawapi_model_monitor.js --once
+node wawapi_model_monitor.js --daemon
+node wawapi_model_monitor.js --once --report-current
+```
+
+**职责**:
+- 读取 `WAWAPI_API_KEY` 和本地备用配置；
+- 使用 Bearer 鉴权请求固定 WawAPI endpoint；
+- 通过 `xbk_storage.js` 原子读写单一状态文件；
+- 使用锁阻止青龙任务和常驻实例重叠；
+- 通过 `xbk_loop.js` 支持常驻模式和安全停止。
+
+### `wawapi_model_monitor.local.js.example` — WawAPI 本地配置模板
+
+**定位**:本地 Key、关注列表和运行配置的示例，不含真实密钥；复制为 `wawapi_model_monitor.local.js` 后使用，真实文件由 `.gitignore` 忽略。
+
+---
+
 ### `xbk_storage.js` — 安全文件与状态存储基础设施
 
 **定位**:统一普通文件检查、安全原子写入、受保护文本读取；消息缓存、运行日志和告警/日报状态共用同一套文件安全边界。
@@ -158,6 +195,17 @@ npm run test:mutation
 ---
 
 ## 二、测试相关
+
+### `test_wawapi_model_monitor.js` — WawAPI 模型监测回归
+
+**定位**:使用 mock HTTP、内存状态和通知函数验证模型上新/下架、空列表、API 异常、状态提交、配置优先级、锁和两种运行模式。
+
+**运行**:
+```bash
+npm run test:model-monitor
+```
+
+不使用真实 WawAPI Key，不发送真实通知；空列表、鉴权失败、超时、通知失败和状态文件异常均通过故障注入覆盖。
 
 ### `test_filter.js` — 单元测试
 
@@ -346,8 +394,17 @@ node qinglong/xbk_push.js
 # 运行推送(真实拉取+推送)
 npm start
 
+# WawAPI 模型监测：青龙/cron 单次执行
+node wawapi_model_monitor.js --once
+# WawAPI 模型监测：服务器常驻执行
+node wawapi_model_monitor.js --daemon
+# WawAPI 模型监测：主动报告当前列表
+node wawapi_model_monitor.js --once --report-current
+
 # 跑全部测试
 npm test
+# 模型监测专项测试
+npm run test:model-monitor
 # 或分别运行：
 npm run test:filter
 npm run test:app

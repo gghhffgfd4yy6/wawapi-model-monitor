@@ -19,7 +19,8 @@ const SUITES = [
   // v3.172：集成测试走并行调度器（worker 独立缓存目录 + 失败片串行重跑）。
   // 需要完整串行验证时直接 node test_app.js（CI 即如此）
   { name: '集成测试', file: 'test_app_p.js', desc: 'App.run 完整主流程(并行调度,失败自动重跑)' },
-  { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏' }
+  { name: '通道测试', file: 'test_notify.js', desc: '推送通道请求构造+脱敏' },
+  { name: 'WawAPI模型监测', file: 'test_wawapi_model_monitor.js', desc: '模型上新下架、空列表、API异常和运行模式' }
 ]
 
 const results = []

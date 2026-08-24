@@ -35,6 +35,7 @@
 - 缓存所在磁盘余量监测（低于阈值告警，不阻断推送；平台不支持时自动跳过）
 - 运行日志 `run.log`（成功摘要 / ERROR 行，1MB 自动截断）；日志密钥脱敏
 - 用户特定配置外置（`push_config.local.js` 含真实密钥，绝不入库）
+- 独立 WawAPI 模型目录监测：比较相邻有效快照，提醒模型上新、下架、空列表和 API 异常
 
 ---
 
@@ -106,6 +107,48 @@ npm start
 
 常驻模式应在青龙中只运行一个实例，避免多个进程同时推送同一批数据。
 
+## 🔎 WawAPI 模型目录监测
+
+`wawapi_model_monitor.js` 是独立于线报主流程的模型目录监测入口，读取：
+
+```text
+https://wawapii.com/v1/models
+```
+
+配置 WawAPI Key 时，环境变量优先：
+
+```bash
+export WAWAPI_API_KEY='你的 WawAPI API Key'
+```
+
+Termux 等本地环境也可以复制示例配置：
+
+```bash
+cp wawapi_model_monitor.local.js.example wawapi_model_monitor.local.js
+```
+
+本地配置文件、模型状态和锁文件均不入库。通知复用当前已启用的所有通知渠道。
+
+青龙或 cron 使用单次模式：
+
+```bash
+node wawapi_model_monitor.js --once
+```
+
+服务器、systemd、pm2 或 Docker 使用常驻模式：
+
+```bash
+node wawapi_model_monitor.js --daemon
+```
+
+手动发送当前完整模型列表：
+
+```bash
+node wawapi_model_monitor.js --once --report-current
+```
+
+脚本只保留一份最新的非空模型快照。正常返回时提醒上新和下架；HTTP 200 空列表会立即提醒并保留旧快照；同一持续 API 异常只提醒一次，恢复后发送恢复通知。轮询间隔可以通过 `WAWAPI_MODEL_INTERVAL_MS` 配置。
+
 ## 🧪 测试与系统验证
 
 ```bash
@@ -116,6 +159,7 @@ npm test            # 全量测试（推荐）
 npm run test:filter
 npm run test:app
 npm run test:notify
+npm run test:model-monitor
 ```
 
 - **三套件分工**：`test_filter.js`（单元/属性/Fuzz/性能基准/版本一致性）→ `test_app.js`（集成测试 worker，mock 完整主流程）→ `test_notify.js`（通道请求构造 + 密钥脱敏）；推荐入口 `npm run test:app` 由 `test_app_p.js` 并行调度，需串行完整验证时使用 `npm run test:app:serial`

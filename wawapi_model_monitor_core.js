@@ -107,10 +107,6 @@ function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = 
   }
 }
 
-function normalizeStatus (status) {
-  return VALID_STATUSES.has(status) ? status : STATUS.HEALTHY
-}
-
 function normalizeModelsOrNull (models) {
   if (models === null) return null
   if (!Array.isArray(models) || models.some(id => typeof id !== 'string' || id.trim() === '')) {
@@ -132,11 +128,14 @@ function normalizeState (state) {
   if (state.lastObservationAt !== null && typeof state.lastObservationAt !== 'string') {
     throw monitorError('STATE_INVALID', '状态文件中的观测时间无效')
   }
+  if (!VALID_STATUSES.has(state.lastStatus)) {
+    throw monitorError('STATE_INVALID', '状态文件中的状态无效')
+  }
   return {
     schemaVersion: 1,
     lastNonEmptyModels: normalizeModelsOrNull(state.lastNonEmptyModels),
     lastObservationAt: state.lastObservationAt || null,
-    lastStatus: normalizeStatus(state.lastStatus),
+    lastStatus: state.lastStatus,
     activeIncident: activeIncident ? { kind: activeIncident.kind, key: activeIncident.key } : null
   }
 }

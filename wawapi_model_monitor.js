@@ -100,11 +100,21 @@ function readLockInfo (lockPath) {
 }
 
 function withInstanceLock (lockPath, task) {
-  const acquire = () => {
+  const openOwnedLock = () => {
+    const fd = fs.openSync(lockPath, 'wx', 0o600)
     try {
-      const fd = fs.openSync(lockPath, 'wx', 0o600)
       fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), 'utf8')
       return fd
+    } catch (error) {
+      try { fs.closeSync(fd) } catch (closeError) { /* 原始写入错误优先 */ }
+      throw error
+    }
+  }
+
+  const acquire = () => {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true })
+    try {
+      return openOwnedLock()
     } catch (error) {
       if (!error || error.code !== 'EEXIST') throw error
       const info = readLockInfo(lockPath)
@@ -112,9 +122,7 @@ function withInstanceLock (lockPath, task) {
       try { fs.unlinkSync(lockPath) } catch (unlinkError) {
         throw monitorError('LOCK_HELD', '残留锁无法安全清理')
       }
-      const retryFd = fs.openSync(lockPath, 'wx', 0o600)
-      fs.writeFileSync(retryFd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), 'utf8')
-      return retryFd
+      return openOwnedLock()
     }
   }
 

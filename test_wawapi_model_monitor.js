@@ -10,7 +10,8 @@ const {
   createEmptyState,
   monitorOnce,
   resolveMonitorConfig,
-  incidentKey
+  incidentKey,
+  normalizeState
 } = require('./wawapi_model_monitor_core')
 const {
   fetchModels,
@@ -433,6 +434,145 @@ async function test (name, fn) {
     assert.equal(notices.length, 1)
     assert.match(notices[0].title, /当前模型列表/)
     assert.match(notices[0].body, /model-a/)
+  })
+
+  await test('多个 HTTP API 异常都保留旧快照并立即分类提醒', async () => {
+    for (const statusCode of [403, 404, 429, 500]) {
+      const store = makeStateStore({
+        schemaVersion: 1,
+        lastNonEmptyModels: ['model-a'],
+        lastObservationAt: '2026-08-24T23:55:00.000Z',
+        lastStatus: 'healthy',
+        activeIncident: null
+      })
+      const notices = []
+      const result = await monitorOnce({
+        readState: store.read,
+        writeState: store.write,
+        fetchModels: async () => ({ statusCode, body: '{}' }),
+        notify: async (title, body) => notices.push({ title, body }),
+        now: () => new Date('2026-08-25T00:00:00.000Z')
+      })
+      assert.equal(result.outcome, 'api_error')
+      assert.equal(notices.length, 1)
+      assert.match(notices[0].title, /API异常/)
+      assert.deepEqual(store.get().lastNonEmptyModels, ['model-a'])
+    }
+  })
+
+  await test('超时、无效 JSON 和缺失模型 ID 都分类为 API 异常', async () => {
+    const scenarios = [
+      {
+        fetchModels: async () => { const error = new Error('timeout'); error.code = 'ETIMEDOUT'; throw error }
+      },
+      { fetchModels: async () => ({ statusCode: 200, body: '{bad-json' }) },
+      { fetchModels: async () => ({ statusCode: 200, body: JSON.stringify({ data: [{}] }) }) }
+    ]
+    for (const scenario of scenarios) {
+      const store = makeStateStore({
+        schemaVersion: 1,
+        lastNonEmptyModels: ['model-a'],
+        lastObservationAt: '2026-08-24T23:55:00.000Z',
+        lastStatus: 'healthy',
+        activeIncident: null
+      })
+      const notices = []
+      const result = await monitorOnce({
+        readState: store.read,
+        writeState: store.write,
+        fetchModels: scenario.fetchModels,
+        notify: async (title, body) => notices.push({ title, body }),
+        now: () => new Date('2026-08-25T00:00:00.000Z')
+      })
+      assert.equal(result.outcome, 'api_error')
+      assert.equal(notices.length, 1)
+      assert.deepEqual(store.get().lastNonEmptyModels, ['model-a'])
+    }
+  })
+
+  await test('API 错误恢复时只发送一次恢复通知', async () => {
+    const store = makeStateStore({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: '2026-08-25T00:00:00.000Z',
+      lastStatus: 'api_error',
+      activeIncident: { kind: 'api_error', key: 'api_error:HTTP_500' }
+    })
+    const notices = []
+    const run = () => monitorOnce({
+      readState: store.read,
+      writeState: store.write,
+      fetchModels: async () => jsonResponse(['model-a']),
+      notify: async (title, body) => notices.push({ title, body }),
+      now: () => new Date('2026-08-25T00:05:00.000Z')
+    })
+    const first = await run()
+    const second = await run()
+    assert.equal(first.outcome, 'recovered')
+    assert.equal(second.outcome, 'unchanged')
+    assert.equal(notices.length, 1)
+    assert.match(notices[0].title, /监测恢复/)
+  })
+
+  await test('缺少 API Key 时 CLI 返回非零且不请求网络', async () => {
+    let requested = false
+    const errors = []
+    const code = await main(['--once'], {
+      config: { apiKey: '', stateFile: '/tmp/wawapi-state.json' },
+      request: async () => { requested = true },
+      logger: { log: () => {}, error: message => errors.push(message) }
+    })
+    assert.equal(code, 1)
+    assert.equal(requested, false)
+    assert.match(errors[0], /CONFIG_MISSING_API_KEY/)
+  })
+
+  await test('状态文件符号链接不会被读取', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-symlink-'))
+    const targetPath = path.join(dir, 'target.json')
+    const statePath = path.join(dir, 'state.json')
+    fs.writeFileSync(targetPath, JSON.stringify(createEmptyState()), 'utf8')
+    fs.symlinkSync(targetPath, statePath)
+    await assert.rejects(
+      createStateStore(statePath).read(),
+      error => error.code === 'STATE_INVALID'
+    )
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('无法判断锁持有者时不删除锁文件', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-lock-invalid-'))
+    const lockPath = path.join(dir, 'state.json.lock')
+    fs.writeFileSync(lockPath, '{not-json', 'utf8')
+    await assert.rejects(
+      withInstanceLock(lockPath, async () => {}),
+      error => error.code === 'LOCK_HELD'
+    )
+    assert.equal(fs.existsSync(lockPath), true)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('状态文件未知状态不会静默归一化', () => {
+    assert.throws(
+      () => normalizeState({
+        schemaVersion: 1,
+        lastNonEmptyModels: ['model-a'],
+        lastObservationAt: null,
+        lastStatus: 'unknown',
+        activeIncident: null
+      }),
+      error => error.code === 'STATE_INVALID'
+    )
+  })
+
+  await test('锁目录不存在时会先创建父目录', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-lock-parent-'))
+    const lockPath = path.join(dir, 'nested', 'state.json.lock')
+    await withInstanceLock(lockPath, async () => {
+      assert.equal(fs.existsSync(lockPath), true)
+    })
+    assert.equal(fs.existsSync(lockPath), false)
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)

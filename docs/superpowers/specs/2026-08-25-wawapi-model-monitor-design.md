@@ -103,7 +103,7 @@ WAWAPI_MODEL_STATE_FILE
 
 字段语义：
 
-- `lastNonEmptyModels`：最近一次已提交的非空模型快照。出现模型变更且所有通知渠道都失败时，继续保留上一份已提交快照，直到变更通知成功。
+- `lastNonEmptyModels`：最近一次已提交的非空模型快照；尚未建立基线时为 `null`。出现模型变更且所有通知渠道都失败时，继续保留上一份已提交快照，直到变更通知成功。
 - `lastObservationAt`：最近一次可分类观测的时间。
 - `lastStatus`：`healthy`、`empty_models` 或 `api_error`。
 - `activeIncident`：当前已成功提醒但尚未恢复的异常类型；正常状态为 `null`。如果所有通知渠道都失败，则不把异常标记为已提醒，下一轮继续尝试。

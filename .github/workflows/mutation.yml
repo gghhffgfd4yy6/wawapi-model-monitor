@@ -97,7 +97,7 @@ jobs:
           node-version: 24
 
       - name: 下载各段变异报告
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: mutation-reports
           pattern: mutation-report-*

@@ -31,7 +31,7 @@ jobs:
             echo "run_id=$(gh run list --workflow=mutation.yml --limit=1 --json databaseId --jq '.[0].databaseId')" >> "$GITHUB_OUTPUT"
           fi
       - name: 下载全部变异报告
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: reports-all
           pattern: mutation-report-*

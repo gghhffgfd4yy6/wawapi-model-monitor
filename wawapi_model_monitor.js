@@ -1,15 +1,18 @@
 'use strict'
 
 const fs = require('fs')
+const path = require('path')
 const got = require('got')
 const {
   ENDPOINT,
   createEmptyState,
   monitorError,
+  monitorOnce,
   normalizeState,
   resolveMonitorConfig
 } = require('./wawapi_model_monitor_core')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
+const { runLoop } = require('./xbk_loop')
 
 function fetchModels ({ apiKey, request = got }) {
   return request(ENDPOINT, {
@@ -125,13 +128,153 @@ function withInstanceLock (lockPath, task) {
     })
 }
 
+function loadConfig ({ env = process.env, rootDir = __dirname } = {}) {
+  const localPath = path.join(rootDir, 'wawapi_model_monitor.local.js')
+  return resolveMonitorConfig({ env, localConfig: loadLocalConfig(localPath), rootDir })
+}
+
+function defaultNotify (title, body) {
+  const notifyModule = require('./xbk_sendNotify_slim')
+  return notifyModule.sendNotify(title, body)
+}
+
+function runOnce ({
+  config,
+  reportCurrent = false,
+  monitor = monitorOnce,
+  request = got,
+  notify = defaultNotify,
+  stateStore,
+  now
+}) {
+  if (!config || typeof config !== 'object' || typeof config.apiKey !== 'string' || config.apiKey.trim() === '') {
+    return Promise.reject(monitorError('CONFIG_MISSING_API_KEY', '未配置 WAWAPI_API_KEY 或本地 API Key'))
+  }
+  const store = stateStore || createStateStore(config.stateFile)
+  return monitor({
+    readState: store.read,
+    writeState: store.write,
+    fetchModels: () => fetchModels({ apiKey: config.apiKey, request }),
+    notify,
+    now,
+    reportCurrent,
+    watch: { watchExact: config.watchExact || [], watchPrefixes: config.watchPrefixes || [] }
+  })
+}
+
+function runDaemon ({ runOnce: run, intervalMs, signal, loop = runLoop, onError = () => {} }) {
+  if (typeof run !== 'function') return Promise.reject(new TypeError('runDaemon 需要 runOnce 函数'))
+  return loop(run, { intervalMs, signal, onError })
+}
+
+function safeRuntimeError (error) {
+  if (!error) return '未知错误'
+  const code = error.code ? String(error.code) : 'RUNTIME_ERROR'
+  const message = error.message ? String(error.message).slice(0, 200) : ''
+  return message ? `${code}: ${message}` : code
+}
+
+function signalContext (dependencies) {
+  if (dependencies.signal) return { signal: dependencies.signal, cleanup: () => {} }
+  const controller = new AbortController()
+  const stop = () => controller.abort()
+  process.once('SIGTERM', stop)
+  process.once('SIGINT', stop)
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      process.removeListener('SIGTERM', stop)
+      process.removeListener('SIGINT', stop)
+    }
+  }
+}
+
+async function main (argv = [], dependencies = {}) {
+  const logger = dependencies.logger || console
+  let args
+  try { args = parseArgs(argv) } catch (error) {
+    logger.error(safeRuntimeError(error))
+    return 1
+  }
+
+  let config
+  try {
+    config = dependencies.config || loadConfig({ env: dependencies.env || process.env, rootDir: __dirname })
+  } catch (error) {
+    logger.error(safeRuntimeError(error))
+    return 1
+  }
+  if (!config.apiKey) {
+    logger.error('CONFIG_MISSING_API_KEY: 未配置 WAWAPI_API_KEY 或本地 API Key')
+    return 1
+  }
+
+  const lock = dependencies.withInstanceLock || withInstanceLock
+  const lockPath = `${config.stateFile}.lock`
+  const executeOnce = reportCurrent => {
+    if (dependencies.runOnce) return dependencies.runOnce({ config, reportCurrent })
+    return runOnce({
+      config,
+      reportCurrent,
+      monitor: dependencies.monitorOnce || monitorOnce,
+      request: dependencies.request || got,
+      notify: dependencies.notify || defaultNotify,
+      stateStore: dependencies.stateStore,
+      now: dependencies.now
+    })
+  }
+
+  try {
+    return await lock(lockPath, async () => {
+      if (args.mode === 'once') {
+        const result = await executeOnce(args.reportCurrent)
+        return result && result.outcome === 'notification_failed' ? 1 : 0
+      }
+      const context = signalContext(dependencies)
+      let firstRun = true
+      try {
+        await runDaemon({
+          runOnce: () => {
+            const report = args.reportCurrent && firstRun
+            firstRun = false
+            return executeOnce(report)
+          },
+          intervalMs: config.intervalMs,
+          signal: context.signal,
+          loop: dependencies.loop || runLoop,
+          onError: error => logger.error(safeRuntimeError(error))
+        })
+        return 0
+      } finally {
+        context.cleanup()
+      }
+    })
+  } catch (error) {
+    logger.error(safeRuntimeError(error))
+    return 1
+  }
+}
+
+if (require.main === module) {
+  main(process.argv.slice(2)).then(code => {
+    process.exitCode = code
+  }).catch(error => {
+    console.error(safeRuntimeError(error))
+    process.exitCode = 1
+  })
+}
+
 module.exports = {
   ENDPOINT,
   fetchModels,
   parseArgs,
   loadLocalConfig,
+  loadConfig,
   createStateStore,
   withInstanceLock,
   resolveMonitorConfig,
-  createEmptyState
+  createEmptyState,
+  runOnce,
+  runDaemon,
+  main
 }

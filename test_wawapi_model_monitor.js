@@ -17,7 +17,9 @@ const {
   parseArgs,
   loadLocalConfig,
   createStateStore,
-  withInstanceLock
+  withInstanceLock,
+  main,
+  runDaemon
 } = require('./wawapi_model_monitor')
 
 let passed = 0
@@ -358,6 +360,35 @@ async function test (name, fn) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-config-'))
     assert.deepEqual(loadLocalConfig(path.join(dir, 'missing.local.js')), {})
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('单次模式只调用一次核心监测', async () => {
+    let calls = 0
+    const code = await main(['--once'], {
+      config: { apiKey: 'sk-test-key', stateFile: '/tmp/wawapi-state.json', watchExact: [], watchPrefixes: [] },
+      monitorOnce: async () => { calls += 1; return { outcome: 'unchanged' } },
+      withInstanceLock: async (_path, task) => task(),
+      logger: { log: () => {}, error: () => {} }
+    })
+    assert.equal(code, 0)
+    assert.equal(calls, 1)
+  })
+
+  await test('常驻模式把同一个 runOnce 交给调度器', async () => {
+    let calls = 0
+    const controller = new AbortController()
+    const loop = async run => {
+      await run()
+      calls += 1
+      controller.abort()
+    }
+    await runDaemon({
+      runOnce: async () => { calls += 1 },
+      intervalMs: 300000,
+      signal: controller.signal,
+      loop
+    })
+    assert.equal(calls, 2)
   })
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)

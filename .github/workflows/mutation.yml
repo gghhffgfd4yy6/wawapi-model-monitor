@@ -74,7 +74,7 @@ jobs:
       # 明细报告留档（inc-*.json + mutation.json/html），artifact 有公开下载 API
       - name: 上传变异报告
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: mutation-report-${{ matrix.name }}
           path: reports/

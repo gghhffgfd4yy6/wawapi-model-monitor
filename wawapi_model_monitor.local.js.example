@@ -1,0 +1,7 @@
+// 复制为 wawapi_model_monitor.local.js 后填写本机密钥；该本地文件已被 Git 忽略。
+module.exports = {
+  apiKey: '',
+  watchExact: [],
+  watchPrefixes: [],
+  intervalMs: 300000
+}

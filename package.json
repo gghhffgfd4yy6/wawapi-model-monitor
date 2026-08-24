@@ -1,0 +1,19 @@
+{
+  "name": "wawapi-model-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monitor WawAPI model availability and notify on model changes.",
+  "main": "wawapi_model_monitor.js",
+  "scripts": {
+    "start": "node wawapi_model_monitor.js --daemon",
+    "start:once": "node wawapi_model_monitor.js --once",
+    "report": "node wawapi_model_monitor.js --once --report-current",
+    "test": "node test_wawapi_model_monitor.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "got": "11.8.6"
+  }
+}

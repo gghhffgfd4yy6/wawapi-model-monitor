@@ -1,6 +1,9 @@
 'use strict'
 
 const assert = require('assert/strict')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
 const {
   normalizeModelIds,
   diffModelIds,
@@ -9,6 +12,13 @@ const {
   resolveMonitorConfig,
   incidentKey
 } = require('./wawapi_model_monitor_core')
+const {
+  fetchModels,
+  parseArgs,
+  loadLocalConfig,
+  createStateStore,
+  withInstanceLock
+} = require('./wawapi_model_monitor')
 
 let passed = 0
 let failed = 0
@@ -277,6 +287,77 @@ async function test (name, fn) {
     })
     assert.equal(result.stateCommitted, true)
     assert.deepEqual(store.get().lastNonEmptyModels, ['model-b'])
+  })
+
+  await test('WawAPI 请求使用固定 endpoint 和 Bearer 鉴权', async () => {
+    let captured
+    const response = await fetchModels({
+      apiKey: 'sk-test-key',
+      request: async (url, options) => {
+        captured = { url, options }
+        return { statusCode: 200, body: '{"object":"list","data":[]}' }
+      }
+    })
+    assert.equal(response.statusCode, 200)
+    assert.equal(captured.url, 'https://wawapii.com/v1/models')
+    assert.equal(captured.options.headers.authorization, 'Bearer sk-test-key')
+    assert.equal(captured.options.throwHttpErrors, false)
+    assert.equal(captured.options.retry.limit, 0)
+  })
+
+  await test('CLI 参数解析支持两种运行模式', () => {
+    assert.deepEqual(parseArgs(['--once']), { mode: 'once', reportCurrent: false })
+    assert.deepEqual(parseArgs(['--daemon', '--report-current']), { mode: 'daemon', reportCurrent: true })
+    assert.throws(() => parseArgs(['--unknown']), /未知参数/)
+  })
+
+  await test('状态文件可原子读写并拒绝损坏 JSON', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-state-'))
+    const statePath = path.join(dir, 'state.json')
+    const store = createStateStore(statePath)
+    assert.equal(await store.read(), null)
+    await store.write({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: '2026-08-25T00:00:00.000Z',
+      lastStatus: 'healthy',
+      activeIncident: null
+    })
+    assert.deepEqual((await store.read()).lastNonEmptyModels, ['model-a'])
+    fs.writeFileSync(statePath, '{bad-json', 'utf8')
+    await assert.rejects(store.read(), error => error.code === 'STATE_INVALID')
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('活跃锁阻止并发实例，任务结束后释放', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-lock-'))
+    const lockPath = path.join(dir, 'state.json.lock')
+    await withInstanceLock(lockPath, async () => {
+      await assert.rejects(
+        withInstanceLock(lockPath, async () => {}),
+        error => error.code === 'LOCK_HELD'
+      )
+      assert.equal(fs.existsSync(lockPath), true)
+    })
+    assert.equal(fs.existsSync(lockPath), false)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('已退出进程的残留锁可安全恢复', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-stale-'))
+    const lockPath = path.join(dir, 'state.json.lock')
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 2147483647, startedAt: '2026-08-25T00:00:00.000Z' }), 'utf8')
+    let ran = false
+    await withInstanceLock(lockPath, async () => { ran = true })
+    assert.equal(ran, true)
+    assert.equal(fs.existsSync(lockPath), false)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('本地配置文件不存在时返回空对象', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-monitor-config-'))
+    assert.deepEqual(loadLocalConfig(path.join(dir, 'missing.local.js')), {})
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)

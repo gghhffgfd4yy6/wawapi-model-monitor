@@ -1,6 +1,9 @@
 node_modules/
 .worktrees/
 xianbaoku_cache*/
+wawapi_model_monitor.local.js
+xianbaoku_cache/wawapi_model_monitor_state.json
+xianbaoku_cache/wawapi_model_monitor_state.json.lock
 push_config.local.js
 .git.corrupt_backup/
 .tools/

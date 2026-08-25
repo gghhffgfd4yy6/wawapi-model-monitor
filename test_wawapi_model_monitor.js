@@ -830,6 +830,62 @@ async function test (name, fn) {
     fsx.rmSync(dir, { recursive: true, force: true })
   })
 
+  await test('N1: probeModels 配置去重', () => {
+    const config = resolveMonitorConfig({
+      env: {},
+      localConfig: { apiKeys: ['k'], probeModels: ['m1', 'm1', 'm2', 'm1'] },
+      rootDir: '/tmp/monitor'
+    })
+    assert.deepEqual(config.probeModels, ['m1', 'm2'])
+  })
+
+  await test('N2: 所有 Key 返回畸形 data 项 → 抛 INVALID_MODEL_RESPONSE 而非空列表', async () => {
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['k1', 'k2'],
+        request: async () => ({ statusCode: 200, body: JSON.stringify({ data: [{}] }) })
+      }),
+      error => error.code === 'INVALID_MODEL_RESPONSE'
+    )
+  })
+
+  await test('N4: 多 Key 合并按模型 ID 去重', async () => {
+    const merged = await fetchModelsMulti({
+      apiKeys: ['a', 'b'],
+      request: async (url, options) => {
+        const key = options.headers.authorization.replace('Bearer ', '')
+        if (key === 'a') return { statusCode: 200, body: JSON.stringify({ data: [{ id: 'm1' }, { id: 'm2' }] }) }
+        return { statusCode: 200, body: JSON.stringify({ data: [{ id: 'm2' }, { id: 'm3' }] }) }
+      }
+    })
+    const ids = JSON.parse(merged.body).data.map(x => x.id)
+    assert.deepEqual([...new Set(ids)].length, ids.length, '不应有重复模型 ID')
+    assert.deepEqual(ids.sort(), ['m1', 'm2', 'm3'])
+  })
+
+  await test('N3: 启用探测时 daemon 唤醒间隔上限 5 分钟', async () => {
+    let captured = null
+    const loop = async (run, options) => { captured = options.intervalMs; return 0 }
+    await main(['--daemon'], {
+      config: { apiKey: 'k', stateFile: '/tmp/wawapi-state.json', probeModels: ['m1'], probeIntervalMs: 3600000, intervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+      monitorOnce: async () => ({ outcome: 'unchanged' }),
+      withInstanceLock: async (_p, task) => task(),
+      loop,
+      logger: { log: () => {}, error: () => {} }
+    })
+    assert.equal(captured, 300000, '启用探测时间隔应为 5 分钟上限')
+    // 未启用探测：保留原间隔
+    captured = null
+    await main(['--daemon'], {
+      config: { apiKey: 'k', stateFile: '/tmp/wawapi-state.json', probeModels: [], probeIntervalMs: 3600000, intervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+      monitorOnce: async () => ({ outcome: 'unchanged' }),
+      withInstanceLock: async (_p, task) => task(),
+      loop,
+      logger: { log: () => {}, error: () => {} }
+    })
+    assert.equal(captured, 3600000, '未启用探测时应保留原间隔')
+  })
+
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)
   if (failed > 0) process.exitCode = 1
 })()

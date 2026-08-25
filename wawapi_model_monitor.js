@@ -41,6 +41,7 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
   )
   const mergedData = []
   const errors = []
+  const seenIds = new Set() // N4: 按模型 ID 去重
   let validResponses = 0 // 有合法 HTTP 200 + data 数组的响应数（即使 data 为空）
   for (let i = 0; i < results.length; i++) {
     const r = results[i]
@@ -56,9 +57,26 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
         errors.push({ index: i, error })
         continue
       }
+      // N2: 校验每一个 data 项；存在非法项（缺 id / id 为空）则整个响应视为无效，
+      // 避免“所有 Key 都返回畸形 data”时被合成成空列表误报为“模型全部下架”。
+      let allValid = true
+      for (const item of body.data) {
+        if (!item || typeof item !== 'object' || typeof item.id !== 'string' || item.id.trim() === '') {
+          allValid = false
+          break
+        }
+      }
+      if (!allValid) {
+        const error = monitorError('INVALID_MODEL_RESPONSE', 'WawAPI 响应包含非法模型项')
+        error.statusCode = statusCode || null
+        errors.push({ index: i, error })
+        continue
+      }
       validResponses += 1
       for (const item of body.data) {
-        if (item && typeof item === 'object' && typeof item.id === 'string' && item.id.trim() !== '') {
+        const id = item.id.trim()
+        if (!seenIds.has(id)) {
+          seenIds.add(id)
           mergedData.push(item)
         }
       }
@@ -520,6 +538,12 @@ async function main (argv = [], dependencies = {}) {
       }
       const context = signalContext(dependencies)
       let firstRun = true
+      // N3: 启用探测时，daemon 唤醒间隔最多 5 分钟——失败态模型固定 5 分钟重试，
+      // 不能受 config.intervalMs 影响（否则配 1 小时时失败模型 1 小时才探一次）。
+      const probeEnabled = Array.isArray(config.probeModels) && config.probeModels.length > 0
+      const effectiveInterval = probeEnabled
+        ? Math.min(config.intervalMs, 300000)
+        : config.intervalMs
       try {
         await runDaemon({
           runOnce: () => {
@@ -527,7 +551,7 @@ async function main (argv = [], dependencies = {}) {
             firstRun = false
             return executeOnce(report)
           },
-          intervalMs: config.intervalMs,
+          intervalMs: effectiveInterval,
           signal: context.signal,
           loop: dependencies.loop || runLoop,
           onError: error => logger.error(safeRuntimeError(error))

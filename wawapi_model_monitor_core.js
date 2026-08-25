@@ -101,7 +101,8 @@ function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = 
     )
   )
   // 模型探测：默认关闭；配置 probeModels 后才启用。probeIntervalMs 控制两次探测的最小间隔。
-  const probeModels = listValue(firstConfigured(env.WAWAPI_PROBE_MODELS, localConfig.probeModels))
+  // N1: 配置去重，避免同一模型被探测两次/发两条通知。
+  const probeModels = [...new Set(listValue(firstConfigured(env.WAWAPI_PROBE_MODELS, localConfig.probeModels)))]
   const probeIntervalRaw = firstConfigured(env.WAWAPI_PROBE_INTERVAL_MS, localConfig.probeIntervalMs)
   const parsedProbeInterval = Number(probeIntervalRaw)
   const probeIntervalMs = probeModels.length > 0 && Number.isFinite(parsedProbeInterval) && parsedProbeInterval >= 0

@@ -41,12 +41,13 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
   )
   const mergedData = []
   const errors = []
+  let validResponses = 0 // 有合法 HTTP 200 + data 数组的响应数（即使 data 为空）
   for (let i = 0; i < results.length; i++) {
     const r = results[i]
     if (r.status === 'fulfilled') {
       const statusCode = r.value && Number.isInteger(r.value.statusCode) ? r.value.statusCode : 0
       const body = parseResponseBodySafe(r.value && r.value.body)
-      // HTTP 非 200 或响应体缺少 data 数组：视为该 Key 失败（避免所有 Key 集体报错时被误判成空列表）。
+      // HTTP 非 200 或响应体缺少 data 数组：视为该 Key 失败
       if (statusCode !== 200 || !body || !Array.isArray(body.data)) {
         const error = statusCode >= 100
           ? monitorError(`HTTP_${statusCode}`, `WawAPI 返回 HTTP ${statusCode}`)
@@ -55,6 +56,7 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
         errors.push({ index: i, error })
         continue
       }
+      validResponses += 1
       for (const item of body.data) {
         if (item && typeof item === 'object' && typeof item.id === 'string' && item.id.trim() !== '') {
           mergedData.push(item)
@@ -64,8 +66,8 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
       errors.push({ index: i, error: r.reason })
     }
   }
-  // 全部失败时抛出第一个错误：让 monitorOnce 归类为 API 异常而不是空列表
-  if (mergedData.length === 0 && errors.length > 0) {
+  // 仅当没有任何 Key 返回合法模型列表响应时才抛错：合法空列表（data:[]）应视为成功观测
+  if (validResponses === 0 && errors.length > 0) {
     throw errors[0].error
   }
   return { statusCode: 200, body: JSON.stringify({ data: mergedData, object: 'list' }) }
@@ -77,11 +79,29 @@ function parseResponseBodySafe (body) {
   try { return JSON.parse(body) } catch (e) { return null }
 }
 
-// 判断探测响应是否真的包含生成内容（空数组/空字符串不能算成功）。
+// 判断探测响应是否真的包含生成内容（空数组/空字符串/无内容项都不能算成功）。
 function probeBodyHasContent (body) {
   if (!body || typeof body !== 'object') return false
-  if (Array.isArray(body.choices) && body.choices.length > 0) return true
-  if (Array.isArray(body.data) && body.data.length > 0) return true
+  // choices：必须至少一项含非空内容字段（message.content / text / content / reasoning_content）
+  if (Array.isArray(body.choices)) {
+    for (const choice of body.choices) {
+      if (!choice || typeof choice !== 'object') continue
+      const msg = choice.message && typeof choice.message === 'object' ? choice.message : null
+      if (msg && typeof msg.content === 'string' && msg.content.trim() !== '') return true
+      if (typeof choice.text === 'string' && choice.text.trim() !== '') return true
+      if (typeof choice.content === 'string' && choice.content.trim() !== '') return true
+      if (msg && typeof msg.reasoning_content === 'string' && msg.reasoning_content.trim() !== '') return true
+    }
+    return false
+  }
+  if (Array.isArray(body.data)) {
+    for (const item of body.data) {
+      if (!item || typeof item !== 'object') continue
+      if (typeof item.text === 'string' && item.text.trim() !== '') return true
+      if (typeof item.content === 'string' && item.content.trim() !== '') return true
+    }
+    return false
+  }
   if (typeof body.output_text === 'string' && body.output_text.trim() !== '') return true
   if (typeof body.reasoning === 'string' && body.reasoning.trim() !== '') return true
   if (typeof body.reasoning_content === 'string' && body.reasoning_content.trim() !== '') return true
@@ -139,17 +159,30 @@ async function probeModelWithKeys ({ model, apiKeys, request, fetchProbe = fetch
   return { ok: false, detail: `${detail}（${validKeys.length - okCount}个Key不可用）` }
 }
 
-// 执行一次模型探测：对每个指定模型判断是否该测（距上次成功响应 >= interval），
+// 判断某个模型本轮是否该探测：
+// - 无记录/无时间戳 → 到期（首次或状态损坏）
+// - 失败态 → 固定 5 分钟重试（S6：不受外层 daemon 间隔影响）
+// - 成功态 → 按 probeIntervalMs 间隔；0/负值视为每次到期（C3）
+// - 无效日期 → 到期（S3：避免 NaN 比较导致永不探测）
+function isProbeDue (prev, probeIntervalMs, nowMs) {
+  if (!prev || !prev.lastProbedAt) return true
+  const lastMs = new Date(prev.lastProbedAt).getTime()
+  if (!Number.isFinite(lastMs)) return true
+  if (prev.state !== 'ok') {
+    return nowMs - lastMs >= 300000 // 失败/未知：5 分钟重试
+  }
+  if (probeIntervalMs <= 0) return true
+  return nowMs - lastMs >= probeIntervalMs
+}
+
+// 执行一次模型探测：对每个指定模型判断是否该测，
 // 需要测的并发发出请求（多 Key 任一成功即可用），返回需要发送通知的翻转项。
 // 返回 { notifications: [...], probeStates: [...] } 供调用方持久化。
 async function runProbes ({ apiKeys, probeModels, probeIntervalMs, state, now, request, fetchProbe = fetchModelProbe }) {
   const nowIso = (typeof now === 'function' ? now() : new Date(now || Date.now())).toISOString?.() || new Date().toISOString()
   const nowMs = new Date(nowIso).getTime()
   const existing = new Map((state.probeStates || []).map(p => [p.model, p]))
-  const due = probeModels.filter(model => {
-    const prev = existing.get(model)
-    return !prev || !prev.lastProbedAt || prev.state !== 'ok' || (probeIntervalMs > 0 && (nowMs - new Date(prev.lastProbedAt).getTime()) >= probeIntervalMs)
-  })
+  const due = probeModels.filter(model => isProbeDue(existing.get(model), probeIntervalMs, nowMs))
   const notifications = []
   const results = await Promise.allSettled(
     due.map(async model => ({ model, probe: await probeModelWithKeys({ model, apiKeys, request, fetchProbe }) }))
@@ -374,10 +407,11 @@ function runOnce ({
     watch: { watchExact: config.watchExact || [], watchPrefixes: config.watchPrefixes || [] }
   })
 
-  // 模型列表监测与（可选的）指定模型可用性探测并行执行。
+  // 模型列表监测与（可选的）指定模型可用性探测并行执行（S5）：
+  // 同时启动两条流程，探测不再等待主监测完成，互不阻塞。
   if (!probeModels.length) return baseline
 
-  return baseline.then(async result => {
+  const probeFlow = (async () => {
     try {
       const stored = await probeStore.read()
       const { notifications, probeStates } = await runProbesImpl({
@@ -389,19 +423,31 @@ function runOnce ({
         request,
         notify
       })
-      await probeStore.write(probeStates)
-      // 状态翻转的探测项逐个发通知。
+      // S4：先发通知，成功才提交对应模型的新状态；通知失败则回滚，
+      // 下一轮会再次识别翻转并重试通知，避免翻转事件永久丢失。
+      const committed = new Map(probeStates.map(p => [p.model, p]))
       for (const n of notifications) {
+        let sent = false
         try {
           await notify('【WawAPI模型探测】', buildProbeNotice(n))
-        } catch (error) { /* 单条探测通知失败不影响其余 */ }
+          sent = true
+        } catch (error) { /* 单条探测通知失败：不提交该模型新状态，下轮重试 */ }
+        if (!sent) {
+          if (n.previous) {
+            committed.set(n.model, { ...n.previous })
+          } else {
+            committed.delete(n.model) // 首次探测通知失败：回到 unknown，下轮重新探测
+          }
+        }
       }
+      await probeStore.write([...committed.values()])
     } catch (error) {
       // 探测失败不应阻断主模型列表监测结果。
       if (typeof console !== 'undefined' && console.error) console.error('模型探测失败:', error && error.message ? error.message : error)
     }
-    return result
-  })
+  })()
+
+  return Promise.all([baseline, probeFlow]).then(([result]) => result)
 }
 
 function runDaemon ({ runOnce: run, intervalMs, signal, loop = runLoop, onError = () => {} }) {
@@ -514,6 +560,7 @@ module.exports = {
   probeBodyHasContent,
   probeModelWithKeys,
   runProbes,
+  isProbeDue,
   createProbeStore,
   buildProbeNotice,
   parseArgs,

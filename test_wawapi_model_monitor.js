@@ -735,6 +735,101 @@ async function test (name, fn) {
     assert.equal(sentBody.max_tokens, 16)
   })
 
+  await test('S1/C1: 合法空列表 + 部分Key失败 → 不抛异常归为空列表', async () => {
+    // 一个 Key 返回合法 200 data:[]，另一个 Key 503：应成功返回空列表而非抛错
+    const merged = await fetchModelsMulti({
+      apiKeys: ['empty', 'bad'],
+      request: async (url, options) => {
+        const key = options.headers.authorization.replace('Bearer ', '')
+        return key === 'empty'
+          ? { statusCode: 200, body: JSON.stringify({ data: [] }) }
+          : { statusCode: 503, body: 'down' }
+      }
+    })
+    assert.equal(merged.statusCode, 200)
+    assert.deepEqual(JSON.parse(merged.body).data, [])
+  })
+
+  await test('S2/C2: choices 项内无内容不算可用', async () => {
+    const cases = [
+      { choices: [{}] },
+      { choices: [{ message: { content: '' } }] },
+      { choices: [{ message: {} }] },
+      { choices: [{ text: '' }] }
+    ]
+    for (const body of cases) {
+      const r = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify(body) }) })
+      assert.equal(r.ok, false, `应判不可用: ${JSON.stringify(body)}`)
+    }
+    // 项内有内容才算可用
+    const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) }) })
+    assert.equal(ok.ok, true)
+    const okText = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ text: 'hi' }] }) }) })
+    assert.equal(okText.ok, true)
+  })
+
+  await test('C3: probeIntervalMs=0 → ok 状态每次仍探测', async () => {
+    const { runProbes } = require('./wawapi_model_monitor')
+    let probes = 0
+    const r = await runProbes({
+      apiKeys: ['k'],
+      probeModels: ['m1'],
+      probeIntervalMs: 0,
+      state: { probeStates: [{ model: 'm1', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }] },
+      now: () => new Date('2026-08-25T00:01:00.000Z'),
+      fetchProbe: async () => { probes++; return { ok: true, detail: '' } }
+    })
+    assert.equal(probes, 1)
+  })
+
+  await test('S3: 损坏时间戳 → 立即重新探测而非永不探测', async () => {
+    const { runProbes } = require('./wawapi_model_monitor')
+    let probes = 0
+    const r = await runProbes({
+      apiKeys: ['k'],
+      probeModels: ['m1'],
+      probeIntervalMs: 3600000,
+      state: { probeStates: [{ model: 'm1', state: 'ok', lastProbedAt: 'invalid-date' }] },
+      now: () => new Date('2026-08-25T00:01:00.000Z'),
+      fetchProbe: async () => { probes++; return { ok: true, detail: '' } }
+    })
+    assert.equal(probes, 1)
+  })
+
+  await test('S6: 失败态固定 5 分钟重试（不跟随外层 intervalMs）', async () => {
+    const { isProbeDue } = require('./wawapi_model_monitor')
+    const nowMs = new Date('2026-08-25T00:06:00.000Z').getTime()
+    // 失败态 4 分钟前探测过：未到 5 分钟 → 不探测
+    assert.equal(isProbeDue({ state: 'failing', lastProbedAt: '2026-08-25T00:02:00.000Z' }, 3600000, nowMs), false)
+    // 失败态 5 分钟后：探测
+    assert.equal(isProbeDue({ state: 'failing', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowMs), true)
+    // 成功态：按 probeIntervalMs（1 小时）
+    assert.equal(isProbeDue({ state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowMs), false)
+  })
+
+  await test('S4: 通知失败时保留旧状态，下轮可重试', async () => {
+    const fsx = require('fs')
+    const osx = require('os')
+    const pathx = require('path')
+    const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'wawapi-s4-'))
+    const stateFile = pathx.join(dir, 'state.json')
+    const notices = []
+    // 首次探测到 failing（unknown->failing），通知失败 → 状态应保持 unknown（不提交 failing）
+    await runOnce({
+      config: { apiKey: 'key', stateFile, probeModels: ['m1'], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+      monitor: async () => ({ outcome: 'unchanged' }),
+      notify: async () => { throw new Error('channel down') },
+      runProbes: async () => ({
+        notifications: [{ model: 'm1', previous: null, next: { state: 'failing' }, detail: 'HTTP 503' }],
+        probeStates: [{ model: 'm1', state: 'failing', lastProbedAt: '2026-08-25T05:00:00.000Z' }]
+      })
+    })
+    // 通知失败 + 无 previous → 不提交新状态（保持空），确保下轮仍会识别翻转
+    const saved = JSON.parse(fsx.readFileSync(pathx.join(dir, 'wawapi_probe_state.json'), 'utf8'))
+    assert.deepEqual(saved.probeStates, [])
+    fsx.rmSync(dir, { recursive: true, force: true })
+  })
+
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)
   if (failed > 0) process.exitCode = 1
 })()

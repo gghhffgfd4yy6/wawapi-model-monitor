@@ -82,8 +82,11 @@ function resolvePath (rootDir, filePath) {
 }
 
 function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = __dirname } = {}) {
-  const apiKeyValue = firstConfigured(env.WAWAPI_API_KEY, localConfig.apiKey)
-  const apiKey = typeof apiKeyValue === 'string' ? apiKeyValue.trim() : ''
+  // 支持单个 apiKey 或 apiKeys 数组
+  const apiKeysRaw = Array.isArray(localConfig.apiKeys) ? localConfig.apiKeys : []
+  const envApiKey = typeof env.WAWAPI_API_KEY === 'string' && env.WAWAPI_API_KEY.trim() ? env.WAWAPI_API_KEY.trim() : ''
+  const localApiKey = typeof localConfig.apiKey === 'string' && localConfig.apiKey.trim() ? localConfig.apiKey.trim() : ''
+  const apiKeys = [...new Set([...apiKeysRaw.map(k => String(k).trim()).filter(Boolean), envApiKey, localApiKey].filter(Boolean))]
   const intervalRaw = firstConfigured(env.WAWAPI_MODEL_INTERVAL_MS, localConfig.intervalMs)
   const parsedInterval = Number(intervalRaw)
   const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 0
@@ -97,14 +100,95 @@ function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = 
       path.join('xianbaoku_cache', 'wawapi_model_monitor_state.json')
     )
   )
+  // 模型探测：默认关闭；配置 probeModels 后才启用。probeIntervalMs 控制两次探测的最小间隔。
+  // N1: 配置去重，避免同一模型被探测两次/发两条通知。
+  const probeModels = [...new Set(listValue(firstConfigured(env.WAWAPI_PROBE_MODELS, localConfig.probeModels)))]
+  const probeIntervalRaw = firstConfigured(env.WAWAPI_PROBE_INTERVAL_MS, localConfig.probeIntervalMs)
+  const parsedProbeInterval = Number(probeIntervalRaw)
+  const probeIntervalMs = probeModels.length > 0 && Number.isFinite(parsedProbeInterval) && parsedProbeInterval >= 0
+    ? parsedProbeInterval
+    : 3600000 // 默认 1 小时
   return {
     endpoint: ENDPOINT,
-    apiKey,
+    apiKey: apiKeys[0] || '',
+    apiKeys,
     intervalMs,
     stateFile,
     watchExact: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_EXACT, localConfig.watchExact)),
-    watchPrefixes: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_PREFIX, localConfig.watchPrefixes))
+    watchPrefixes: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_PREFIX, localConfig.watchPrefixes)),
+    probeModels,
+    probeIntervalMs
   }
+}
+
+// 模型探测状态：记录每个指定模型最近一次可用性探测结果。
+function createProbeState (model) {
+  return {
+    model,
+    state: 'unknown', // unknown | ok | failing
+    lastProbedAt: null
+  }
+}
+
+// 归一化探测状态数组；非法项丢弃，缺字段补默认。
+function normalizeProbeStates (probeStates) {
+  if (probeStates === null || probeStates === undefined) return []
+  if (!Array.isArray(probeStates)) throw monitorError('STATE_INVALID', '状态文件中的探测状态无效')
+  return probeStates
+    .filter(item => item && typeof item === 'object' && typeof item.model === 'string' && item.model.trim())
+    .map(item => ({
+      model: item.model.trim(),
+      state: item.state === 'ok' || item.state === 'failing' ? item.state : 'unknown',
+      lastProbedAt: typeof item.lastProbedAt === 'string' ? item.lastProbedAt : null
+    }))
+}
+
+// 判断某个模型本次探测是否应执行（core 唯一实现，monitor.isProbeDue 委托此处）：
+// - 无记录/无时间戳 → 到期（首次或状态损坏）
+// - 无效日期 → 到期（避免 NaN 比较导致永不探测）
+// - 失败/未知态 → 距上次探测 >= 5 分钟（固定重试间隔，不受外层 daemon 间隔影响）
+// - 成功态 → 按 probeIntervalMs 间隔；<=0 视为每次到期
+function shouldProbe (probeState, probeIntervalMs, nowIso) {
+  const now = new Date(nowIso).getTime()
+  if (!Number.isFinite(now)) return true
+  if (!probeState || !probeState.lastProbedAt) return true
+  const last = new Date(probeState.lastProbedAt).getTime()
+  if (!Number.isFinite(last)) return true
+  if (probeState.state !== 'ok') {
+    return now - last >= 300000 // 失败/未知：5 分钟重试
+  }
+  if (probeIntervalMs <= 0) return true
+  return now - last >= probeIntervalMs
+}
+
+// 探测结果归一化：成功/失败两个状态枚举。
+function probeResult (ok, detail) {
+  return ok
+    ? { state: 'ok', detail: detail || '' }
+    : { state: 'failing', detail: detail || '无响应' }
+}
+
+// 对比旧状态->新状态，返回是否需要通知（core 唯一实现）：
+// - unknown -> ok：首次建立正常基线，不通知。
+// - unknown -> failing：首次探测就发现模型挂了，需要通知。
+// - ok <-> failing：状态翻转（刚挂/刚恢复），需要通知。
+// - failing -> failing / ok -> ok：持续同态，不通知。
+function probeTransition (previous, next) {
+  const prev = previous ? previous.state : 'unknown'
+  if (prev === 'unknown') return next.state === 'failing'
+  return prev !== next.state
+}
+
+// 生成探测报告文本（用于通知）。
+function buildProbeReport ({ model, previous, next }) {
+  const okLabels = { ok: '✅ 可用', failing: '❌ 不可用', unknown: '未知' }
+  const prevLabel = previous ? okLabels[previous.state] || '未知' : '首次探测'
+  const lines = [
+    `模型：${model}`,
+    `状态：${prevLabel} → ${okLabels[next.state]}`
+  ]
+  if (next.detail) lines.push(`说明：${next.detail}`)
+  return lines.join('\n')
 }
 
 function normalizeModelsOrNull (models) {
@@ -434,5 +518,11 @@ module.exports = {
   buildErrorBody,
   buildRecoveryBody,
   buildReportBody,
+  createProbeState,
+  normalizeProbeStates,
+  shouldProbe,
+  probeResult,
+  probeTransition,
+  buildProbeReport,
   monitorError
 }

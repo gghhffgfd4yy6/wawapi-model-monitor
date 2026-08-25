@@ -9,6 +9,7 @@ const {
   monitorError,
   monitorOnce,
   normalizeState,
+  normalizeProbeStates,
   resolveMonitorConfig
 } = require('./wawapi_model_monitor_core')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
@@ -25,6 +26,162 @@ function fetchModels ({ apiKey, request = got }) {
     retry: { limit: 0 },
     timeout: { request: 10000 }
   })
+}
+
+// 并发请求多个 API Key，合并去重模型列表，返回合成响应对象
+async function fetchModelsMulti ({ apiKeys, request = got }) {
+  if (!Array.isArray(apiKeys) || apiKeys.length === 0) {
+    throw monitorError('CONFIG_MISSING_API_KEY', '未配置任何 API Key')
+  }
+  if (apiKeys.length === 1) {
+    return fetchModels({ apiKey: apiKeys[0], request })
+  }
+  const results = await Promise.allSettled(
+    apiKeys.map(key => fetchModels({ apiKey: key, request }))
+  )
+  const mergedData = []
+  const errors = []
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i]
+    if (r.status === 'fulfilled') {
+      const statusCode = r.value && Number.isInteger(r.value.statusCode) ? r.value.statusCode : 0
+      const body = parseResponseBodySafe(r.value && r.value.body)
+      // HTTP 非 200 或响应体缺少 data 数组：视为该 Key 失败（避免所有 Key 集体报错时被误判成空列表）。
+      if (statusCode !== 200 || !body || !Array.isArray(body.data)) {
+        const error = statusCode >= 100
+          ? monitorError(`HTTP_${statusCode}`, `WawAPI 返回 HTTP ${statusCode}`)
+          : monitorError('INVALID_MODEL_RESPONSE', 'WawAPI 响应缺少 data 数组')
+        error.statusCode = statusCode || null
+        errors.push({ index: i, error })
+        continue
+      }
+      for (const item of body.data) {
+        if (item && typeof item === 'object' && typeof item.id === 'string' && item.id.trim() !== '') {
+          mergedData.push(item)
+        }
+      }
+    } else {
+      errors.push({ index: i, error: r.reason })
+    }
+  }
+  // 全部失败时抛出第一个错误：让 monitorOnce 归类为 API 异常而不是空列表
+  if (mergedData.length === 0 && errors.length > 0) {
+    throw errors[0].error
+  }
+  return { statusCode: 200, body: JSON.stringify({ data: mergedData, object: 'list' }) }
+}
+
+function parseResponseBodySafe (body) {
+  if (body && typeof body === 'object') return body
+  if (typeof body !== 'string') return null
+  try { return JSON.parse(body) } catch (e) { return null }
+}
+
+// 判断探测响应是否真的包含生成内容（空数组/空字符串不能算成功）。
+function probeBodyHasContent (body) {
+  if (!body || typeof body !== 'object') return false
+  if (Array.isArray(body.choices) && body.choices.length > 0) return true
+  if (Array.isArray(body.data) && body.data.length > 0) return true
+  if (typeof body.output_text === 'string' && body.output_text.trim() !== '') return true
+  if (typeof body.reasoning === 'string' && body.reasoning.trim() !== '') return true
+  if (typeof body.reasoning_content === 'string' && body.reasoning_content.trim() !== '') return true
+  return false
+}
+
+// 对单个模型发一次极短请求验证是否可响应。
+// 成功：HTTP 200 且解析出真实内容；否则视为失败。
+// max_tokens 用 16 而非 1：部分 OpenAI 兼容接口拒绝 max_tokens=1（最小限制/字段名差异），
+// 16 足够验证可用性且成本极低，同时提高兼容性。
+async function fetchModelProbe ({ apiKey, model, request = got }) {
+  const res = await request('https://wawapii.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      accept: 'application/json',
+      'content-type': 'application/json'
+    },
+    json: {
+      model,
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 16,
+      stream: false
+    },
+    responseType: 'text',
+    throwHttpErrors: false,
+    retry: { limit: 0 },
+    timeout: { request: 20000 }
+  })
+  if (res.statusCode !== 200) {
+    return { ok: false, detail: `HTTP ${res.statusCode}` }
+  }
+  const body = parseResponseBodySafe(res.body)
+  if (probeBodyHasContent(body)) return { ok: true, detail: '' }
+  return { ok: false, detail: '响应缺少内容' }
+}
+
+// 并发用多个 Key 探测同一模型，任一 Key 成功即视为可用（返回其成功结果）。
+// 全部失败时返回第一个失败结果（带成功尝试次数的摘要）。
+// 跳过可能在 HTTP 头中非法的 Key（如含非 ASCII 字符的截断 Key），避免整组探测被污染。
+async function probeModelWithKeys ({ model, apiKeys, request, fetchProbe = fetchModelProbe }) {
+  const validKeys = (apiKeys || []).filter(k => typeof k === 'string' && /^[\x21-\x7E]+$/.test(k) && k.trim())
+  if (validKeys.length === 0) return { ok: false, detail: '无可用 API Key' }
+  const results = await Promise.allSettled(
+    validKeys.map(key => fetchProbe({ apiKey: key, model, request }))
+  )
+  let firstFailure = null
+  let okCount = 0
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value && r.value.ok) { okCount += 1; return r.value }
+    if (r.status === 'fulfilled' && r.value && !firstFailure) firstFailure = r.value
+    else if (r.status === 'rejected' && !firstFailure) firstFailure = { ok: false, detail: (r.reason && r.reason.message ? r.reason.message : '请求失败').slice(0, 60) }
+  }
+  const detail = firstFailure && firstFailure.detail ? firstFailure.detail : '无响应'
+  return { ok: false, detail: `${detail}（${validKeys.length - okCount}个Key不可用）` }
+}
+
+// 执行一次模型探测：对每个指定模型判断是否该测（距上次成功响应 >= interval），
+// 需要测的并发发出请求（多 Key 任一成功即可用），返回需要发送通知的翻转项。
+// 返回 { notifications: [...], probeStates: [...] } 供调用方持久化。
+async function runProbes ({ apiKeys, probeModels, probeIntervalMs, state, now, request, fetchProbe = fetchModelProbe }) {
+  const nowIso = (typeof now === 'function' ? now() : new Date(now || Date.now())).toISOString?.() || new Date().toISOString()
+  const nowMs = new Date(nowIso).getTime()
+  const existing = new Map((state.probeStates || []).map(p => [p.model, p]))
+  const due = probeModels.filter(model => {
+    const prev = existing.get(model)
+    return !prev || !prev.lastProbedAt || prev.state !== 'ok' || (probeIntervalMs > 0 && (nowMs - new Date(prev.lastProbedAt).getTime()) >= probeIntervalMs)
+  })
+  const notifications = []
+  const results = await Promise.allSettled(
+    due.map(async model => ({ model, probe: await probeModelWithKeys({ model, apiKeys, request, fetchProbe }) }))
+  )
+  const nextStates = [...existing.values()]
+  for (const r of results) {
+    if (r.status !== 'fulfilled') continue
+    const { model, probe } = r.value
+    const prev = existing.get(model)
+    const nextState = {
+      model,
+      state: probe.ok ? 'ok' : 'failing',
+      lastProbedAt: nowIso
+    }
+    const idx = nextStates.findIndex(p => p.model === model)
+    if (idx >= 0) nextStates[idx] = nextState
+    else nextStates.push(nextState)
+    // 通知策略（只在状态变化或首次发现异常时通知，避免持续不可用重复轰炸）：
+    // - unknown -> ok：首次建立正常基线，不打扰。
+    // - unknown -> failing：首次探测就发现模型挂了，立即告知。
+    // - ok <-> failing：状态翻转（刚挂/刚恢复），通知。
+    // - failing -> failing：持续不可用，不重复通知。
+    // - ok -> ok：持续可用，不通知。
+    const prevState = prev ? prev.state : 'unknown'
+    // 首次探测发现模型挂了（unknown->failing）立即告知；否则只在状态翻转时通知。
+    const firstDown = prevState === 'unknown' && nextState.state === 'failing'
+    const flip = prevState !== 'unknown' && prevState !== nextState.state
+    if (firstDown || flip) {
+      notifications.push({ model, previous: prev, next: nextState, detail: probe.detail })
+    }
+  }
+  return { notifications, probeStates: nextStates }
 }
 
 function parseArgs (argv = []) {
@@ -77,6 +234,36 @@ function createStateStore (statePath) {
       if (!ok) throw monitorError('STATE_WRITE_FAILED', '状态文件写入失败')
     }
   }
+}
+
+// 模型探测状态存储：与主状态文件分离，使用独立文件，避免 core normalizeState 丢弃额外字段。
+function createProbeStore (statePath) {
+  return {
+    read: async () => {
+      const result = readSafeTextResult(statePath)
+      if (result.status === 'missing') return []
+      if (result.status !== 'ok') throw monitorError('PROBE_STATE_INVALID', `探测状态读取失败：${result.status}`)
+      try {
+        const parsed = JSON.parse(result.text)
+        return normalizeProbeStates(Array.isArray(parsed) ? parsed : (parsed && parsed.probeStates))
+      } catch (error) {
+        throw monitorError('PROBE_STATE_INVALID', '探测状态不是合法 JSON')
+      }
+    },
+    write: async probeStates => {
+      const ok = writeAtomic(statePath, JSON.stringify({ probeStates: normalizeProbeStates(probeStates) }, null, 2), 'WawAPI模型探测状态')
+      if (!ok) throw monitorError('PROBE_STATE_WRITE_FAILED', '探测状态写入失败')
+    }
+  }
+}
+
+// 组装单条探测通知正文。
+function buildProbeNotice (n) {
+  const labels = { ok: '✅ 可用', failing: '❌ 不可用', unknown: '未知' }
+  const prev = n.previous ? labels[n.previous.state] || '未知' : '首次探测'
+  const lines = [`模型：${n.model}`, `状态：${prev} → ${labels[n.next.state] || n.next.state}`]
+  if (n.detail) lines.push(`说明：${n.detail}`)
+  return lines.join('\n')
 }
 
 function processAlive (pid) {
@@ -146,6 +333,15 @@ function defaultNotify (title, body) {
   return notifyModule.sendNotify(title, body)
 }
 
+function resolveApiKeys (config) {
+  if (!config) return []
+  if (Array.isArray(config.apiKeys)) {
+    return config.apiKeys.map(k => String(k).trim()).filter(Boolean)
+  }
+  if (typeof config.apiKey === 'string' && config.apiKey.trim()) return [config.apiKey.trim()]
+  return []
+}
+
 function runOnce ({
   config,
   reportCurrent = false,
@@ -153,20 +349,58 @@ function runOnce ({
   request = got,
   notify = defaultNotify,
   stateStore,
+  runProbes: runProbesImpl = runProbes,
   now
 }) {
-  if (!config || typeof config !== 'object' || typeof config.apiKey !== 'string' || config.apiKey.trim() === '') {
+  const apiKeys = resolveApiKeys(config)
+  if (!apiKeys.length) {
     return Promise.reject(monitorError('CONFIG_MISSING_API_KEY', '未配置 WAWAPI_API_KEY 或本地 API Key'))
   }
   const store = stateStore || createStateStore(config.stateFile)
-  return monitor({
+
+  const probeModels = Array.isArray(config.probeModels) ? config.probeModels.filter(m => typeof m === 'string' && m.trim()) : []
+  // 探测状态单独存文件，避免与模型列表状态（core normalizeState 会丢弃额外字段）耦合。
+  const probeStore = createProbeStore(
+    config.probeStateFile || path.join(path.dirname(config.stateFile), 'wawapi_probe_state.json')
+  )
+
+  const baseline = monitor({
     readState: store.read,
     writeState: store.write,
-    fetchModels: () => fetchModels({ apiKey: config.apiKey, request }),
+    fetchModels: () => fetchModelsMulti({ apiKeys, request }),
     notify,
     now,
     reportCurrent,
     watch: { watchExact: config.watchExact || [], watchPrefixes: config.watchPrefixes || [] }
+  })
+
+  // 模型列表监测与（可选的）指定模型可用性探测并行执行。
+  if (!probeModels.length) return baseline
+
+  return baseline.then(async result => {
+    try {
+      const stored = await probeStore.read()
+      const { notifications, probeStates } = await runProbesImpl({
+        apiKeys,
+        probeModels,
+        probeIntervalMs: config.probeIntervalMs,
+        state: { probeStates: stored },
+        now,
+        request,
+        notify
+      })
+      await probeStore.write(probeStates)
+      // 状态翻转的探测项逐个发通知。
+      for (const n of notifications) {
+        try {
+          await notify('【WawAPI模型探测】', buildProbeNotice(n))
+        } catch (error) { /* 单条探测通知失败不影响其余 */ }
+      }
+    } catch (error) {
+      // 探测失败不应阻断主模型列表监测结果。
+      if (typeof console !== 'undefined' && console.error) console.error('模型探测失败:', error && error.message ? error.message : error)
+    }
+    return result
   })
 }
 
@@ -275,6 +509,13 @@ if (require.main === module) {
 module.exports = {
   ENDPOINT,
   fetchModels,
+  fetchModelsMulti,
+  fetchModelProbe,
+  probeBodyHasContent,
+  probeModelWithKeys,
+  runProbes,
+  createProbeStore,
+  buildProbeNotice,
   parseArgs,
   loadLocalConfig,
   loadConfig,

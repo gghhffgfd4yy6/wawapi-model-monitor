@@ -82,8 +82,11 @@ function resolvePath (rootDir, filePath) {
 }
 
 function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = __dirname } = {}) {
-  const apiKeyValue = firstConfigured(env.WAWAPI_API_KEY, localConfig.apiKey)
-  const apiKey = typeof apiKeyValue === 'string' ? apiKeyValue.trim() : ''
+  // 支持单个 apiKey 或 apiKeys 数组
+  const apiKeysRaw = Array.isArray(localConfig.apiKeys) ? localConfig.apiKeys : []
+  const envApiKey = typeof env.WAWAPI_API_KEY === 'string' && env.WAWAPI_API_KEY.trim() ? env.WAWAPI_API_KEY.trim() : ''
+  const localApiKey = typeof localConfig.apiKey === 'string' && localConfig.apiKey.trim() ? localConfig.apiKey.trim() : ''
+  const apiKeys = [...new Set([...apiKeysRaw.map(k => String(k).trim()).filter(Boolean), envApiKey, localApiKey].filter(Boolean))]
   const intervalRaw = firstConfigured(env.WAWAPI_MODEL_INTERVAL_MS, localConfig.intervalMs)
   const parsedInterval = Number(intervalRaw)
   const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 0
@@ -97,14 +100,83 @@ function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = 
       path.join('xianbaoku_cache', 'wawapi_model_monitor_state.json')
     )
   )
+  // 模型探测：默认关闭；配置 probeModels 后才启用。probeIntervalMs 控制两次探测的最小间隔。
+  const probeModels = listValue(firstConfigured(env.WAWAPI_PROBE_MODELS, localConfig.probeModels))
+  const probeIntervalRaw = firstConfigured(env.WAWAPI_PROBE_INTERVAL_MS, localConfig.probeIntervalMs)
+  const parsedProbeInterval = Number(probeIntervalRaw)
+  const probeIntervalMs = probeModels.length > 0 && Number.isFinite(parsedProbeInterval) && parsedProbeInterval >= 0
+    ? parsedProbeInterval
+    : 3600000 // 默认 1 小时
   return {
     endpoint: ENDPOINT,
-    apiKey,
+    apiKey: apiKeys[0] || '',
+    apiKeys,
     intervalMs,
     stateFile,
     watchExact: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_EXACT, localConfig.watchExact)),
-    watchPrefixes: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_PREFIX, localConfig.watchPrefixes))
+    watchPrefixes: listValue(firstConfigured(env.WAWAPI_MODEL_WATCH_PREFIX, localConfig.watchPrefixes)),
+    probeModels,
+    probeIntervalMs
   }
+}
+
+// 模型探测状态：记录每个指定模型最近一次可用性探测结果。
+function createProbeState (model) {
+  return {
+    model,
+    state: 'unknown', // unknown | ok | failing
+    lastProbedAt: null
+  }
+}
+
+// 归一化探测状态数组；非法项丢弃，缺字段补默认。
+function normalizeProbeStates (probeStates) {
+  if (probeStates === null || probeStates === undefined) return []
+  if (!Array.isArray(probeStates)) throw monitorError('STATE_INVALID', '状态文件中的探测状态无效')
+  return probeStates
+    .filter(item => item && typeof item === 'object' && typeof item.model === 'string' && item.model.trim())
+    .map(item => ({
+      model: item.model.trim(),
+      state: item.state === 'ok' || item.state === 'failing' ? item.state : 'unknown',
+      lastProbedAt: typeof item.lastProbedAt === 'string' ? item.lastProbedAt : null
+    }))
+}
+
+// 判断某个模型本次探测是否应执行：距上次成功响应已超过 probeIntervalMs。
+function shouldProbe (probeState, probeIntervalMs, nowIso) {
+  if (!probeState || probeState.state !== 'ok') return true
+  if (probeIntervalMs <= 0) return true
+  if (!probeState.lastProbedAt) return true
+  const last = new Date(probeState.lastProbedAt).getTime()
+  const now = new Date(nowIso).getTime()
+  if (Number.isNaN(last) || Number.isNaN(now)) return true
+  return now - last >= probeIntervalMs
+}
+
+// 探测结果归一化：成功/失败两个状态枚举。
+function probeResult (ok, detail) {
+  return ok
+    ? { state: 'ok', detail: detail || '' }
+    : { state: 'failing', detail: detail || '无响应' }
+}
+
+// 对比旧状态->新状态，返回是否发生状态翻转（unknown 不作为翻转）。
+function probeTransition (previous, next) {
+  const prev = previous ? previous.state : 'unknown'
+  if (prev === 'unknown') return false
+  return prev !== next.state
+}
+
+// 生成探测报告文本（用于通知）。
+function buildProbeReport ({ model, previous, next }) {
+  const okLabels = { ok: '✅ 可用', failing: '❌ 不可用', unknown: '未知' }
+  const prevLabel = previous ? okLabels[previous.state] || '未知' : '首次探测'
+  const lines = [
+    `模型：${model}`,
+    `状态：${prevLabel} → ${okLabels[next.state]}`
+  ]
+  if (next.detail) lines.push(`说明：${next.detail}`)
+  return lines.join('\n')
 }
 
 function normalizeModelsOrNull (models) {
@@ -434,5 +506,11 @@ module.exports = {
   buildErrorBody,
   buildRecoveryBody,
   buildReportBody,
+  createProbeState,
+  normalizeProbeStates,
+  shouldProbe,
+  probeResult,
+  probeTransition,
+  buildProbeReport,
   monitorError
 }

@@ -11,14 +11,25 @@ const {
   monitorOnce,
   resolveMonitorConfig,
   incidentKey,
-  normalizeState
+  normalizeState,
+  normalizeProbeStates,
+  shouldProbe,
+  probeResult,
+  probeTransition,
+  buildProbeReport
 } = require('./wawapi_model_monitor_core')
 const {
   fetchModels,
+  fetchModelsMulti,
+  fetchModelProbe,
+  runProbes,
+  createProbeStore,
+  buildProbeNotice,
   parseArgs,
   loadLocalConfig,
   createStateStore,
   withInstanceLock,
+  runOnce,
   main,
   runDaemon
 } = require('./wawapi_model_monitor')
@@ -573,6 +584,155 @@ async function test (name, fn) {
     })
     assert.equal(fs.existsSync(lockPath), false)
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('探测状态归一化丢弃非法项并补默认', () => {
+    assert.deepEqual(
+      normalizeProbeStates([
+        { model: ' m1 ', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' },
+        { model: 'm2', state: 'bogus' },
+        { model: '', state: 'ok' },
+        null
+      ]),
+      [
+        { model: 'm1', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' },
+        { model: 'm2', state: 'unknown', lastProbedAt: null }
+      ]
+    )
+    assert.deepEqual(normalizeProbeStates(null), [])
+  })
+
+  await test('shouldProbe 仅在未知/失败/距上次成功超间隔时触发', () => {
+    const now = '2026-08-25T05:00:00.000Z'
+    assert.equal(shouldProbe(null, 3600000, now), true)
+    assert.equal(shouldProbe({ state: 'ok', lastProbedAt: '2026-08-25T04:30:00.000Z' }, 3600000, now), false)
+    assert.equal(shouldProbe({ state: 'ok', lastProbedAt: '2026-08-25T03:59:00.000Z' }, 3600000, now), true)
+    assert.equal(shouldProbe({ state: 'failing', lastProbedAt: '2026-08-25T04:00:00.000Z' }, 3600000, now), true)
+  })
+
+  await test('探测状态翻转和报告文本', () => {
+    assert.equal(probeTransition(null, { state: 'ok' }), false)
+    assert.equal(probeTransition({ state: 'ok' }, { state: 'failing' }), true)
+    assert.equal(probeTransition({ state: 'ok' }, { state: 'ok' }), false)
+    const body = buildProbeReport({ model: 'm1', previous: { state: 'ok' }, next: probeResult(false, 'HTTP 503') })
+    assert.match(body, /m1/)
+    assert.match(body, /不可用/)
+    assert.match(body, /HTTP 503/)
+  })
+
+  await test('runProbes 首次探测不通知、状态翻转触发通知、间隔内不重复探测', async () => {
+    let probes = 0
+    const calls = []
+    const run = (state, nowIso, ok) => runProbes({
+      apiKeys: ['key'],
+      probeModels: ['m1'],
+      probeIntervalMs: 3600000,
+      state: { probeStates: state },
+      now: () => new Date(nowIso),
+      fetchProbe: async () => { probes++; return ok ? { ok: true, detail: '' } : { ok: false, detail: 'HTTP 503' } }
+    })
+
+    // 首次：unknown -> ok，不通知
+    let r = await run([], '2026-08-25T05:00:00.000Z', true)
+    calls.push(['first', r.notifications.length, probes])
+    assert.equal(r.notifications.length, 0)
+    assert.equal(r.probeStates[0].state, 'ok')
+
+    // 间隔内刚测过：不再探测
+    const p1 = probes
+    r = await run(r.probeStates, '2026-08-25T05:30:00.000Z', true)
+    assert.equal(r.notifications.length, 0)
+    assert.equal(probes, p1) // 未新增探测次数
+
+    // 超 1h 后探测失败：ok -> failing 通知
+    const prev = [{ model: 'm1', state: 'ok', lastProbedAt: '2026-08-25T04:00:00.000Z' }]
+    r = await run(prev, '2026-08-25T05:30:00.000Z', false)
+    assert.equal(r.notifications.length, 1)
+    assert.equal(r.notifications[0].model, 'm1')
+    assert.equal(r.probeStates[0].state, 'failing')
+  })
+
+  await test('runOnce 启用探测时并行执行并持久化探测状态（不干扰模型监测结果）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-probe-once-'))
+    const stateFile = path.join(dir, 'state.json')
+    const probeFile = path.join(dir, 'wawapi_probe_state.json')
+    const notices = []
+    const result = await runOnce({
+      config: { apiKey: 'key', stateFile, probeModels: ['m1'], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+      monitor: async () => ({ outcome: 'unchanged' }),
+      notify: async (t, b) => notices.push({ t, b }),
+      runProbes: async () => ({ notifications: [{ model: 'm1', previous: { state: 'ok' }, next: { state: 'failing' }, detail: 'HTTP 503' }], probeStates: [{ model: 'm1', state: 'failing', lastProbedAt: '2026-08-25T05:00:00.000Z' }] })
+    })
+    assert.equal(result.outcome, 'unchanged')
+    assert.equal(notices.length, 1)
+    assert.match(notices[0].t, /探测/)
+    assert.equal(fs.existsSync(probeFile), true)
+    assert.deepEqual(JSON.parse(fs.readFileSync(probeFile, 'utf8')).probeStates[0].state, 'failing')
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('runOnce 未配置 probeModels 时不创建探测状态', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-no-probe-'))
+    const result = await runOnce({
+      config: { apiKey: 'key', stateFile: path.join(dir, 'state.json'), probeModels: [], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+      monitor: async () => ({ outcome: 'unchanged' }),
+      notify: async () => {}
+    })
+    assert.equal(result.outcome, 'unchanged')
+    assert.equal(fs.existsSync(path.join(dir, 'wawapi_probe_state.json')), false)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('fetchModelProbe HTTP 200 且含内容算可用，否则不可用', async () => {
+    const mockRequest = async (url, options) => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) })
+    const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: mockRequest })
+    assert.equal(ok.ok, true)
+    const bad = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 503, body: '{}' }) })
+    assert.equal(bad.ok, false)
+    assert.match(bad.detail, /503/)
+  })
+
+  await test('所有 Key 都 HTTP 报错时抛 API 异常而非假空列表', async () => {
+    // 全 503：合并逻辑应抛 HTTP_503，让 monitorOnce 归类为 API 异常
+    await assert.rejects(
+      fetchModelsMulti({ apiKeys: ['k1', 'k2'], request: async () => ({ statusCode: 503, body: 'down' }) }),
+      error => error.code === 'HTTP_503'
+    )
+    // 一个成功一个失败：正常合并成功的模型
+    const merged = await fetchModelsMulti({
+      apiKeys: ['ok', 'bad'],
+      request: async (url, options) => {
+        const key = options.headers.authorization.replace('Bearer ', '')
+        return key === 'ok'
+          ? { statusCode: 200, body: JSON.stringify({ data: [{ id: 'm1' }, { id: 'm2' }] }) }
+          : { statusCode: 503, body: 'down' }
+      }
+    })
+    assert.deepEqual(JSON.parse(merged.body).data.map(x => x.id), ['m1', 'm2'])
+    // 多 Key 都返回 200 但缺 data：也算失败
+    await assert.rejects(
+      fetchModelsMulti({ apiKeys: ['k1', 'k2'], request: async () => ({ statusCode: 200, body: JSON.stringify({ foo: 1 }) }) }),
+      error => error.code === 'HTTP_200'
+    )
+  })
+
+  await test('探测响应判定：空数组/空字符串不算可用（B2）', async () => {
+    // 空 choices 数组：旧逻辑会误判可用，现在应判不可用
+    const emptyChoices = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [] }) }) })
+    assert.equal(emptyChoices.ok, false)
+    // 空 data 数组：同理
+    const emptyData = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ data: [] }) }) })
+    assert.equal(emptyData.ok, false)
+    // 空 output_text：不可用
+    const emptyText = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ output_text: '' }) }) })
+    assert.equal(emptyText.ok, false)
+    // 真实内容：可用（choices 非空）
+    const real = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) }) })
+    assert.equal(real.ok, true)
+    // 请求体校验：max_tokens 应 >= 1 且实际使用 16
+    let sentBody = null
+    await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async (url, options) => { sentBody = options.json; return { statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) } } })
+    assert.equal(sentBody.max_tokens, 16)
   })
 
   console.log(`\n结果：${passed} 通过，${failed} 失败\n`)

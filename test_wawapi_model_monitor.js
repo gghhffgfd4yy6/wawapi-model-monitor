@@ -612,7 +612,9 @@ async function test (name, fn) {
 
   await test('探测状态翻转和报告文本', () => {
     assert.equal(probeTransition(null, { state: 'ok' }), false)
+    assert.equal(probeTransition(null, { state: 'failing' }), true) // 首次发现挂了也要通知
     assert.equal(probeTransition({ state: 'ok' }, { state: 'failing' }), true)
+    assert.equal(probeTransition({ state: 'failing' }, { state: 'failing' }), false) // 持续不可用不重复
     assert.equal(probeTransition({ state: 'ok' }, { state: 'ok' }), false)
     const body = buildProbeReport({ model: 'm1', previous: { state: 'ok' }, next: probeResult(false, 'HTTP 503') })
     assert.match(body, /m1/)
@@ -796,15 +798,15 @@ async function test (name, fn) {
     assert.equal(probes, 1)
   })
 
-  await test('S6: 失败态固定 5 分钟重试（不跟随外层 intervalMs）', async () => {
-    const { isProbeDue } = require('./wawapi_model_monitor')
-    const nowMs = new Date('2026-08-25T00:06:00.000Z').getTime()
+  await test('S6: 失败态固定 5 分钟重试（不跟随外层 intervalMs）', () => {
+    const { shouldProbe } = require('./wawapi_model_monitor_core')
+    const nowIso = '2026-08-25T00:06:00.000Z'
     // 失败态 4 分钟前探测过：未到 5 分钟 → 不探测
-    assert.equal(isProbeDue({ state: 'failing', lastProbedAt: '2026-08-25T00:02:00.000Z' }, 3600000, nowMs), false)
+    assert.equal(shouldProbe({ state: 'failing', lastProbedAt: '2026-08-25T00:02:00.000Z' }, 3600000, nowIso), false)
     // 失败态 5 分钟后：探测
-    assert.equal(isProbeDue({ state: 'failing', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowMs), true)
+    assert.equal(shouldProbe({ state: 'failing', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowIso), true)
     // 成功态：按 probeIntervalMs（1 小时）
-    assert.equal(isProbeDue({ state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowMs), false)
+    assert.equal(shouldProbe({ state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }, 3600000, nowIso), false)
   })
 
   await test('S4: 通知失败时保留旧状态，下轮可重试', async () => {

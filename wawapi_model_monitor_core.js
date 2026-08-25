@@ -143,14 +143,21 @@ function normalizeProbeStates (probeStates) {
     }))
 }
 
-// 判断某个模型本次探测是否应执行：距上次成功响应已超过 probeIntervalMs。
+// 判断某个模型本次探测是否应执行（core 唯一实现，monitor.isProbeDue 委托此处）：
+// - 无记录/无时间戳 → 到期（首次或状态损坏）
+// - 无效日期 → 到期（避免 NaN 比较导致永不探测）
+// - 失败/未知态 → 距上次探测 >= 5 分钟（固定重试间隔，不受外层 daemon 间隔影响）
+// - 成功态 → 按 probeIntervalMs 间隔；<=0 视为每次到期
 function shouldProbe (probeState, probeIntervalMs, nowIso) {
-  if (!probeState || probeState.state !== 'ok') return true
-  if (probeIntervalMs <= 0) return true
-  if (!probeState.lastProbedAt) return true
-  const last = new Date(probeState.lastProbedAt).getTime()
   const now = new Date(nowIso).getTime()
-  if (Number.isNaN(last) || Number.isNaN(now)) return true
+  if (!Number.isFinite(now)) return true
+  if (!probeState || !probeState.lastProbedAt) return true
+  const last = new Date(probeState.lastProbedAt).getTime()
+  if (!Number.isFinite(last)) return true
+  if (probeState.state !== 'ok') {
+    return now - last >= 300000 // 失败/未知：5 分钟重试
+  }
+  if (probeIntervalMs <= 0) return true
   return now - last >= probeIntervalMs
 }
 
@@ -161,10 +168,14 @@ function probeResult (ok, detail) {
     : { state: 'failing', detail: detail || '无响应' }
 }
 
-// 对比旧状态->新状态，返回是否发生状态翻转（unknown 不作为翻转）。
+// 对比旧状态->新状态，返回是否需要通知（core 唯一实现）：
+// - unknown -> ok：首次建立正常基线，不通知。
+// - unknown -> failing：首次探测就发现模型挂了，需要通知。
+// - ok <-> failing：状态翻转（刚挂/刚恢复），需要通知。
+// - failing -> failing / ok -> ok：持续同态，不通知。
 function probeTransition (previous, next) {
   const prev = previous ? previous.state : 'unknown'
-  if (prev === 'unknown') return false
+  if (prev === 'unknown') return next.state === 'failing'
   return prev !== next.state
 }
 

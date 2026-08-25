@@ -10,7 +10,10 @@ const {
   monitorOnce,
   normalizeState,
   normalizeProbeStates,
-  resolveMonitorConfig
+  resolveMonitorConfig,
+  shouldProbe,
+  probeTransition,
+  buildProbeReport
 } = require('./wawapi_model_monitor_core')
 const { readSafeTextResult, writeAtomic } = require('./xbk_storage')
 const { runLoop } = require('./xbk_loop')
@@ -177,30 +180,13 @@ async function probeModelWithKeys ({ model, apiKeys, request, fetchProbe = fetch
   return { ok: false, detail: `${detail}（${validKeys.length - okCount}个Key不可用）` }
 }
 
-// 判断某个模型本轮是否该探测：
-// - 无记录/无时间戳 → 到期（首次或状态损坏）
-// - 失败态 → 固定 5 分钟重试（S6：不受外层 daemon 间隔影响）
-// - 成功态 → 按 probeIntervalMs 间隔；0/负值视为每次到期（C3）
-// - 无效日期 → 到期（S3：避免 NaN 比较导致永不探测）
-function isProbeDue (prev, probeIntervalMs, nowMs) {
-  if (!prev || !prev.lastProbedAt) return true
-  const lastMs = new Date(prev.lastProbedAt).getTime()
-  if (!Number.isFinite(lastMs)) return true
-  if (prev.state !== 'ok') {
-    return nowMs - lastMs >= 300000 // 失败/未知：5 分钟重试
-  }
-  if (probeIntervalMs <= 0) return true
-  return nowMs - lastMs >= probeIntervalMs
-}
-
-// 执行一次模型探测：对每个指定模型判断是否该测，
+// 执行一次模型探测：对每个指定模型判断是否该测（委托 core.shouldProbe），
 // 需要测的并发发出请求（多 Key 任一成功即可用），返回需要发送通知的翻转项。
 // 返回 { notifications: [...], probeStates: [...] } 供调用方持久化。
 async function runProbes ({ apiKeys, probeModels, probeIntervalMs, state, now, request, fetchProbe = fetchModelProbe }) {
   const nowIso = (typeof now === 'function' ? now() : new Date(now || Date.now())).toISOString?.() || new Date().toISOString()
-  const nowMs = new Date(nowIso).getTime()
   const existing = new Map((state.probeStates || []).map(p => [p.model, p]))
-  const due = probeModels.filter(model => isProbeDue(existing.get(model), probeIntervalMs, nowMs))
+  const due = probeModels.filter(model => shouldProbe(existing.get(model), probeIntervalMs, nowIso))
   const notifications = []
   const results = await Promise.allSettled(
     due.map(async model => ({ model, probe: await probeModelWithKeys({ model, apiKeys, request, fetchProbe }) }))
@@ -213,23 +199,16 @@ async function runProbes ({ apiKeys, probeModels, probeIntervalMs, state, now, r
     const nextState = {
       model,
       state: probe.ok ? 'ok' : 'failing',
-      lastProbedAt: nowIso
+      lastProbedAt: nowIso,
+      detail: probe.detail || ''
     }
     const idx = nextStates.findIndex(p => p.model === model)
     if (idx >= 0) nextStates[idx] = nextState
     else nextStates.push(nextState)
-    // 通知策略（只在状态变化或首次发现异常时通知，避免持续不可用重复轰炸）：
-    // - unknown -> ok：首次建立正常基线，不打扰。
-    // - unknown -> failing：首次探测就发现模型挂了，立即告知。
-    // - ok <-> failing：状态翻转（刚挂/刚恢复），通知。
-    // - failing -> failing：持续不可用，不重复通知。
-    // - ok -> ok：持续可用，不通知。
-    const prevState = prev ? prev.state : 'unknown'
-    // 首次探测发现模型挂了（unknown->failing）立即告知；否则只在状态翻转时通知。
-    const firstDown = prevState === 'unknown' && nextState.state === 'failing'
-    const flip = prevState !== 'unknown' && prevState !== nextState.state
-    if (firstDown || flip) {
-      notifications.push({ model, previous: prev, next: nextState, detail: probe.detail })
+    // 通知判断委托 core.probeTransition：unknown->ok 不通知；
+    // unknown->failing、ok<->failing 通知；持续同态不通知。
+    if (probeTransition(prev, nextState)) {
+      notifications.push({ model, previous: prev, next: nextState })
     }
   }
   return { notifications, probeStates: nextStates }
@@ -308,13 +287,9 @@ function createProbeStore (statePath) {
   }
 }
 
-// 组装单条探测通知正文。
+// 组装单条探测通知正文（委托 core.buildProbeReport，避免重复实现）。
 function buildProbeNotice (n) {
-  const labels = { ok: '✅ 可用', failing: '❌ 不可用', unknown: '未知' }
-  const prev = n.previous ? labels[n.previous.state] || '未知' : '首次探测'
-  const lines = [`模型：${n.model}`, `状态：${prev} → ${labels[n.next.state] || n.next.state}`]
-  if (n.detail) lines.push(`说明：${n.detail}`)
-  return lines.join('\n')
+  return buildProbeReport(n)
 }
 
 function processAlive (pid) {
@@ -452,7 +427,9 @@ function runOnce ({
         } catch (error) { /* 单条探测通知失败：不提交该模型新状态，下轮重试 */ }
         if (!sent) {
           if (n.previous) {
-            committed.set(n.model, { ...n.previous })
+            // 回滚为旧状态并清空时间戳，使下一轮立即重新探测并重试通知
+            // （不清空的话 ok->failing 回滚成 ok+近期时间戳，isProbeDue 会拒绝重探）。
+            committed.set(n.model, { ...n.previous, lastProbedAt: null })
           } else {
             committed.delete(n.model) // 首次探测通知失败：回到 unknown，下轮重新探测
           }
@@ -584,7 +561,6 @@ module.exports = {
   probeBodyHasContent,
   probeModelWithKeys,
   runProbes,
-  isProbeDue,
   createProbeStore,
   buildProbeNotice,
   parseArgs,

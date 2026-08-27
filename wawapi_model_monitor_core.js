@@ -217,12 +217,16 @@ function normalizeState (state) {
   if (!VALID_STATUSES.has(state.lastStatus)) {
     throw monitorError('STATE_INVALID', '状态文件中的状态无效')
   }
+  const normalizedIncident = activeIncident && activeIncident.kind === STATUS.API_ERROR &&
+    activeIncident.key.startsWith(`${STATUS.API_ERROR}:`)
+    ? { kind: STATUS.API_ERROR, key: STATUS.API_ERROR }
+    : activeIncident
   return {
     schemaVersion: 1,
     lastNonEmptyModels: normalizeModelsOrNull(state.lastNonEmptyModels),
     lastObservationAt: state.lastObservationAt || null,
     lastStatus: state.lastStatus,
-    activeIncident: activeIncident ? { kind: activeIncident.kind, key: activeIncident.key } : null
+    activeIncident: normalizedIncident ? { kind: normalizedIncident.kind, key: normalizedIncident.key } : null
   }
 }
 

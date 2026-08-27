@@ -219,6 +219,17 @@ async function test (name, fn) {
     assert.equal(notices.length, 1)
   })
 
+  await test('加载旧版 API 异常事件时迁移为统一事件键', () => {
+    const state = normalizeState({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: null,
+      lastStatus: 'api_error',
+      activeIncident: { kind: 'api_error', key: 'api_error:HTTP_401' }
+    })
+    assert.deepEqual(state.activeIncident, { kind: 'api_error', key: 'api_error' })
+  })
+
   await test('空列表立即提醒但不覆盖非空快照', async () => {
     const store = makeStateStore({
       schemaVersion: 1,
@@ -682,15 +693,17 @@ async function test (name, fn) {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
-  await test('runOnce 未配置 probeModels 时不创建探测状态', async () => {
+  await test('runOnce 清空 probeModels 时删除旧探测状态', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-no-probe-'))
+    const probeFile = path.join(dir, 'wawapi_probe_state.json')
+    fs.writeFileSync(probeFile, JSON.stringify({ probeStates: [{ model: 'm1', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }] }))
     const result = await runOnce({
       config: { apiKey: 'key', stateFile: path.join(dir, 'state.json'), probeModels: [], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
       monitor: async () => ({ outcome: 'unchanged' }),
       notify: async () => {}
     })
     assert.equal(result.outcome, 'unchanged')
-    assert.equal(fs.existsSync(path.join(dir, 'wawapi_probe_state.json')), false)
+    assert.deepEqual(JSON.parse(fs.readFileSync(probeFile, 'utf8')).probeStates, [])
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
@@ -914,6 +927,23 @@ async function test (name, fn) {
     const result = await fetchModelProbe({ apiKey: 'key', model: 'expected', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: 'fallback', choices: [{ message: { content: 'hi' } }] }) }) })
     assert.equal(result.ok, false)
     assert.match(result.detail, /模型不匹配/)
+  })
+
+  await test('探测响应模型带空白字符时判定为失败', async () => {
+    const result = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: ' m1 ', choices: [{ message: { content: 'hi' } }] }) }) })
+    assert.equal(result.ok, false)
+  })
+
+  await test('多 Key 部分失败时原始拒绝值不会掩盖部分失败错误', async () => {
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['ok', 'bad'],
+        request: async (_url, options) => options.headers.authorization === 'Bearer ok'
+          ? jsonResponse(['model-a'])
+          : Promise.reject(null)
+      }),
+      error => error.code === 'PARTIAL_API_KEY_FAILURE'
+    )
   })
 
   await test('N3: 启用探测时 daemon 唤醒间隔上限 5 分钟', async () => {

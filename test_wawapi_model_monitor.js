@@ -140,10 +140,10 @@ async function test (name, fn) {
     assert.match(config.stateFile, /xianbaoku_cache[\\/]wawapi_model_monitor_state\.json$/)
   })
 
-  await test('incidentKey 对同类异常稳定、对状态码变化敏感', () => {
+  await test('incidentKey 统一 API 异常，避免错误码变化重复通知', () => {
     assert.equal(incidentKey({ status: 'empty_models' }), 'empty_models')
-    assert.equal(incidentKey({ status: 'api_error', code: 'HTTP_401' }), 'api_error:HTTP_401')
-    assert.equal(incidentKey({ status: 'api_error', code: 'HTTP_403' }), 'api_error:HTTP_403')
+    assert.equal(incidentKey({ status: 'api_error', code: 'HTTP_401' }), 'api_error')
+    assert.equal(incidentKey({ status: 'api_error', code: 'HTTP_403' }), 'api_error')
   })
 
   await test('首次非空列表只建立基线', async () => {
@@ -208,6 +208,26 @@ async function test (name, fn) {
     assert.equal(second.outcome, 'api_error')
     assert.equal(notices.length, 1)
     assert.deepEqual(store.get().lastNonEmptyModels, ['model-a'])
+  })
+
+  await test('API 错误码变化时不重复提醒', async () => {
+    const store = makeStateStore({ schemaVersion: 1, lastNonEmptyModels: ['model-a'], lastObservationAt: null, lastStatus: 'healthy', activeIncident: null })
+    const notices = []
+    for (const statusCode of [401, 500]) {
+      await monitorOnce({ readState: store.read, writeState: store.write, fetchModels: async () => jsonResponse([], statusCode), notify: async (...args) => notices.push(args) })
+    }
+    assert.equal(notices.length, 1)
+  })
+
+  await test('加载旧版 API 异常事件时迁移为统一事件键', () => {
+    const state = normalizeState({
+      schemaVersion: 1,
+      lastNonEmptyModels: ['model-a'],
+      lastObservationAt: null,
+      lastStatus: 'api_error',
+      activeIncident: { kind: 'api_error', key: 'api_error:HTTP_401' }
+    })
+    assert.deepEqual(state.activeIncident, { kind: 'api_error', key: 'api_error' })
   })
 
   await test('空列表立即提醒但不覆盖非空快照', async () => {
@@ -673,20 +693,37 @@ async function test (name, fn) {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
-  await test('runOnce 未配置 probeModels 时不创建探测状态', async () => {
+  await test('runOnce 清空 probeModels 时删除旧探测状态', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-no-probe-'))
+    const probeFile = path.join(dir, 'wawapi_probe_state.json')
+    fs.writeFileSync(probeFile, JSON.stringify({ probeStates: [{ model: 'm1', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }] }))
     const result = await runOnce({
       config: { apiKey: 'key', stateFile: path.join(dir, 'state.json'), probeModels: [], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
       monitor: async () => ({ outcome: 'unchanged' }),
       notify: async () => {}
     })
     assert.equal(result.outcome, 'unchanged')
-    assert.equal(fs.existsSync(path.join(dir, 'wawapi_probe_state.json')), false)
+    assert.deepEqual(JSON.parse(fs.readFileSync(probeFile, 'utf8')).probeStates, [])
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  await test('清空探测状态失败不阻断主模型监测', async () => {
+    const originalError = console.error
+    console.error = () => {}
+    try {
+      const result = await runOnce({
+        config: { apiKey: 'key', stateFile: '/dev/null/state.json', probeModels: [], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+        monitor: async () => ({ outcome: 'unchanged' }),
+        notify: async () => {}
+      })
+      assert.equal(result.outcome, 'unchanged')
+    } finally {
+      console.error = originalError
+    }
+  })
+
   await test('fetchModelProbe HTTP 200 且含内容算可用，否则不可用', async () => {
-    const mockRequest = async (url, options) => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) })
+    const mockRequest = async (url, options) => ({ statusCode: 200, body: JSON.stringify({ model: options.json.model, choices: [{ message: { content: 'hi' } }] }) })
     const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: mockRequest })
     assert.equal(ok.ok, true)
     const bad = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 503, body: '{}' }) })
@@ -700,17 +737,19 @@ async function test (name, fn) {
       fetchModelsMulti({ apiKeys: ['k1', 'k2'], request: async () => ({ statusCode: 503, body: 'down' }) }),
       error => error.code === 'HTTP_503'
     )
-    // 一个成功一个失败：正常合并成功的模型
-    const merged = await fetchModelsMulti({
-      apiKeys: ['ok', 'bad'],
-      request: async (url, options) => {
-        const key = options.headers.authorization.replace('Bearer ', '')
-        return key === 'ok'
-          ? { statusCode: 200, body: JSON.stringify({ data: [{ id: 'm1' }, { id: 'm2' }] }) }
-          : { statusCode: 503, body: 'down' }
-      }
-    })
-    assert.deepEqual(JSON.parse(merged.body).data.map(x => x.id), ['m1', 'm2'])
+    // 一个成功一个失败：拒绝不完整列表，避免误报模型下架
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['ok', 'bad'],
+        request: async (url, options) => {
+          const key = options.headers.authorization.replace('Bearer ', '')
+          return key === 'ok'
+            ? { statusCode: 200, body: JSON.stringify({ data: [{ id: 'm1' }, { id: 'm2' }] }) }
+            : { statusCode: 503, body: 'down' }
+        }
+      }),
+      error => error.code === 'PARTIAL_API_KEY_FAILURE'
+    )
     // 多 Key 都返回 200 但缺 data：也算失败
     await assert.rejects(
       fetchModelsMulti({ apiKeys: ['k1', 'k2'], request: async () => ({ statusCode: 200, body: JSON.stringify({ foo: 1 }) }) }),
@@ -729,27 +768,28 @@ async function test (name, fn) {
     const emptyText = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ output_text: '' }) }) })
     assert.equal(emptyText.ok, false)
     // 真实内容：可用（choices 非空）
-    const real = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) }) })
+    const real = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: 'm1', choices: [{ message: { content: 'hi' } }] }) }) })
     assert.equal(real.ok, true)
     // 请求体校验：max_tokens 应 >= 1 且实际使用 16
     let sentBody = null
-    await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async (url, options) => { sentBody = options.json; return { statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) } } })
+    await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async (url, options) => { sentBody = options.json; return { statusCode: 200, body: JSON.stringify({ model: 'm1', choices: [{ message: { content: 'hi' } }] }) } } })
     assert.equal(sentBody.max_tokens, 16)
   })
 
-  await test('S1/C1: 合法空列表 + 部分Key失败 → 不抛异常归为空列表', async () => {
-    // 一个 Key 返回合法 200 data:[]，另一个 Key 503：应成功返回空列表而非抛错
-    const merged = await fetchModelsMulti({
-      apiKeys: ['empty', 'bad'],
-      request: async (url, options) => {
-        const key = options.headers.authorization.replace('Bearer ', '')
-        return key === 'empty'
-          ? { statusCode: 200, body: JSON.stringify({ data: [] }) }
-          : { statusCode: 503, body: 'down' }
-      }
-    })
-    assert.equal(merged.statusCode, 200)
-    assert.deepEqual(JSON.parse(merged.body).data, [])
+  await test('S1/C1: 合法空列表 + 部分Key失败 → 拒绝不完整观测', async () => {
+    // 一个 Key 返回合法 200 data:[]，另一个 Key 503：不能误报为全部模型下架。
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['empty', 'bad'],
+        request: async (url, options) => {
+          const key = options.headers.authorization.replace('Bearer ', '')
+          return key === 'empty'
+            ? { statusCode: 200, body: JSON.stringify({ data: [] }) }
+            : { statusCode: 503, body: 'down' }
+        }
+      }),
+      error => error.code === 'PARTIAL_API_KEY_FAILURE'
+    )
   })
 
   await test('S2/C2: choices 项内无内容不算可用', async () => {
@@ -760,13 +800,14 @@ async function test (name, fn) {
       { choices: [{ text: '' }] }
     ]
     for (const body of cases) {
+      body.model = 'm1'
       const r = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify(body) }) })
       assert.equal(r.ok, false, `应判不可用: ${JSON.stringify(body)}`)
     }
     // 项内有内容才算可用
-    const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ message: { content: 'hi' } }] }) }) })
+    const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: 'm1', choices: [{ message: { content: 'hi' } }] }) }) })
     assert.equal(ok.ok, true)
-    const okText = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ choices: [{ text: 'hi' }] }) }) })
+    const okText = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: 'm1', choices: [{ text: 'hi' }] }) }) })
     assert.equal(okText.ok, true)
   })
 
@@ -863,6 +904,61 @@ async function test (name, fn) {
     const ids = JSON.parse(merged.body).data.map(x => x.id)
     assert.deepEqual([...new Set(ids)].length, ids.length, '不应有重复模型 ID')
     assert.deepEqual(ids.sort(), ['m1', 'm2', 'm3'])
+  })
+
+  await test('多 Key 部分失败不返回不完整模型列表', async () => {
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['ok', 'bad'],
+        request: async (_url, options) => options.headers.authorization === 'Bearer ok'
+          ? jsonResponse(['model-a'])
+          : { statusCode: 500, body: '{}' }
+      }),
+      error => error.code === 'PARTIAL_API_KEY_FAILURE'
+    )
+  })
+
+  await test('环境变量 Key 优先于本地 apiKeys，过小轮询间隔回退默认值', () => {
+    const config = resolveMonitorConfig({ env: { WAWAPI_API_KEY: 'env-key', WAWAPI_MODEL_INTERVAL_MS: '0' }, localConfig: { apiKeys: ['old-key'] }, rootDir: '/tmp' })
+    assert.deepEqual(config.apiKeys, ['env-key', 'old-key'])
+    assert.equal(config.apiKey, 'env-key')
+    assert.equal(config.intervalMs, 300000)
+  })
+
+  await test('保存探测状态时清理已移除模型', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wawapi-prune-probes-'))
+    const stateFile = path.join(dir, 'state.json')
+    fs.writeFileSync(path.join(dir, 'wawapi_probe_state.json'), JSON.stringify({ probeStates: [
+      { model: 'keep', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' },
+      { model: 'removed', state: 'ok', lastProbedAt: '2026-08-25T00:00:00.000Z' }
+    ] }))
+    await runOnce({ config: { apiKey: 'key', stateFile, probeModels: ['keep'], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] }, monitor: async () => ({ outcome: 'unchanged' }), notify: async () => {}, runProbes: async ({ state }) => ({ notifications: [], probeStates: state.probeStates }) })
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, 'wawapi_probe_state.json'), 'utf8'))
+    assert.deepEqual(saved.probeStates.map(item => item.model), ['keep'])
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  await test('探测响应模型不匹配时判定为失败', async () => {
+    const result = await fetchModelProbe({ apiKey: 'key', model: 'expected', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: 'fallback', choices: [{ message: { content: 'hi' } }] }) }) })
+    assert.equal(result.ok, false)
+    assert.match(result.detail, /模型不匹配/)
+  })
+
+  await test('探测响应模型带空白字符时判定为失败', async () => {
+    const result = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: async () => ({ statusCode: 200, body: JSON.stringify({ model: ' m1 ', choices: [{ message: { content: 'hi' } }] }) }) })
+    assert.equal(result.ok, false)
+  })
+
+  await test('多 Key 部分失败时原始拒绝值不会掩盖部分失败错误', async () => {
+    await assert.rejects(
+      fetchModelsMulti({
+        apiKeys: ['ok', 'bad'],
+        request: async (_url, options) => options.headers.authorization === 'Bearer ok'
+          ? jsonResponse(['model-a'])
+          : Promise.reject(null)
+      }),
+      error => error.code === 'PARTIAL_API_KEY_FAILURE'
+    )
   })
 
   await test('N3: 启用探测时 daemon 唤醒间隔上限 5 分钟', async () => {

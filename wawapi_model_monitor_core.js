@@ -4,6 +4,7 @@ const path = require('path')
 
 const ENDPOINT = 'https://wawapii.com/v1/models'
 const DEFAULT_INTERVAL_MS = 300000
+const MIN_INTERVAL_MS = 1000
 
 const STATUS = Object.freeze({
   HEALTHY: 'healthy',
@@ -86,10 +87,11 @@ function resolveMonitorConfig ({ env = process.env, localConfig = {}, rootDir = 
   const apiKeysRaw = Array.isArray(localConfig.apiKeys) ? localConfig.apiKeys : []
   const envApiKey = typeof env.WAWAPI_API_KEY === 'string' && env.WAWAPI_API_KEY.trim() ? env.WAWAPI_API_KEY.trim() : ''
   const localApiKey = typeof localConfig.apiKey === 'string' && localConfig.apiKey.trim() ? localConfig.apiKey.trim() : ''
-  const apiKeys = [...new Set([...apiKeysRaw.map(k => String(k).trim()).filter(Boolean), envApiKey, localApiKey].filter(Boolean))]
+  // 环境变量用于运行时临时覆盖，必须成为首选 Key；其余 Key 仍可用于冗余查询。
+  const apiKeys = [...new Set([envApiKey, ...apiKeysRaw.map(k => String(k).trim()).filter(Boolean), localApiKey].filter(Boolean))]
   const intervalRaw = firstConfigured(env.WAWAPI_MODEL_INTERVAL_MS, localConfig.intervalMs)
   const parsedInterval = Number(intervalRaw)
-  const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= 0
+  const intervalMs = Number.isFinite(parsedInterval) && parsedInterval >= MIN_INTERVAL_MS
     ? parsedInterval
     : DEFAULT_INTERVAL_MS
   const stateFile = resolvePath(
@@ -215,23 +217,22 @@ function normalizeState (state) {
   if (!VALID_STATUSES.has(state.lastStatus)) {
     throw monitorError('STATE_INVALID', '状态文件中的状态无效')
   }
+  const normalizedIncident = activeIncident && activeIncident.kind === STATUS.API_ERROR &&
+    activeIncident.key.startsWith(`${STATUS.API_ERROR}:`)
+    ? { kind: STATUS.API_ERROR, key: STATUS.API_ERROR }
+    : activeIncident
   return {
     schemaVersion: 1,
     lastNonEmptyModels: normalizeModelsOrNull(state.lastNonEmptyModels),
     lastObservationAt: state.lastObservationAt || null,
     lastStatus: state.lastStatus,
-    activeIncident: activeIncident ? { kind: activeIncident.kind, key: activeIncident.key } : null
+    activeIncident: normalizedIncident ? { kind: normalizedIncident.kind, key: normalizedIncident.key } : null
   }
 }
 
 function incidentKey (observation) {
   if (!observation || observation.status === STATUS.EMPTY) return STATUS.EMPTY
-  if (observation.status === STATUS.API_ERROR) {
-    const code = typeof observation.code === 'string' && observation.code.trim() !== ''
-      ? observation.code.trim().toUpperCase()
-      : 'UNKNOWN'
-    return `${STATUS.API_ERROR}:${code}`
-  }
+  if (observation.status === STATUS.API_ERROR) return STATUS.API_ERROR
   return ''
 }
 
@@ -502,6 +503,7 @@ async function monitorOnce ({
 module.exports = {
   ENDPOINT,
   DEFAULT_INTERVAL_MS,
+  MIN_INTERVAL_MS,
   STATUS,
   TITLES,
   normalizeModelIds,

@@ -31,7 +31,8 @@ function fetchModels ({ apiKey, request = got }) {
   })
 }
 
-// 并发请求多个 API Key，合并去重模型列表，返回合成响应对象
+// 并发请求多个 API Key，只有全部成功时才合并模型列表。
+// 任一 Key 失败意味着结果不完整，不能覆盖模型快照或触发上下架判断。
 async function fetchModelsMulti ({ apiKeys, request = got }) {
   if (!Array.isArray(apiKeys) || apiKeys.length === 0) {
     throw monitorError('CONFIG_MISSING_API_KEY', '未配置任何 API Key')
@@ -87,8 +88,12 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
       errors.push({ index: i, error: r.reason })
     }
   }
-  // 仅当没有任何 Key 返回合法模型列表响应时才抛错：合法空列表（data:[]）应视为成功观测
-  if (validResponses === 0 && errors.length > 0) {
+  if (errors.length > 0) {
+    if (validResponses > 0) {
+      const error = monitorError('PARTIAL_API_KEY_FAILURE', `${errors.length}/${apiKeys.length} 个 API Key 请求失败，拒绝使用不完整模型列表`)
+      error.statusCode = errors[0].error && errors[0].error.statusCode || null
+      throw error
+    }
     throw errors[0].error
   }
   return { statusCode: 200, body: JSON.stringify({ data: mergedData, object: 'list' }) }
@@ -130,7 +135,7 @@ function probeBodyHasContent (body) {
 }
 
 // 对单个模型发一次极短请求验证是否可响应。
-// 成功：HTTP 200 且解析出真实内容；否则视为失败。
+// 成功：HTTP 200、响应模型与请求模型严格一致，且解析出真实内容；否则视为失败。
 // max_tokens 用 16 而非 1：部分 OpenAI 兼容接口拒绝 max_tokens=1（最小限制/字段名差异），
 // 16 足够验证可用性且成本极低，同时提高兼容性。
 async function fetchModelProbe ({ apiKey, model, request = got }) {
@@ -156,6 +161,10 @@ async function fetchModelProbe ({ apiKey, model, request = got }) {
     return { ok: false, detail: `HTTP ${res.statusCode}` }
   }
   const body = parseResponseBodySafe(res.body)
+  if (!body || typeof body.model !== 'string' || body.model !== model) {
+    const actualModel = body && typeof body.model === 'string' ? body.model.trim() : '缺失'
+    return { ok: false, detail: `响应模型不匹配（期望 ${model}，实际 ${actualModel}）` }
+  }
   if (probeBodyHasContent(body)) return { ok: true, detail: '' }
   return { ok: false, detail: '响应缺少内容' }
 }
@@ -191,7 +200,7 @@ async function runProbes ({ apiKeys, probeModels, probeIntervalMs, state, now, r
   const results = await Promise.allSettled(
     due.map(async model => ({ model, probe: await probeModelWithKeys({ model, apiKeys, request, fetchProbe }) }))
   )
-  const nextStates = [...existing.values()]
+  const nextStates = probeModels.map(model => existing.get(model)).filter(Boolean)
   for (const r of results) {
     if (r.status !== 'fulfilled') continue
     const { model, probe } = r.value
@@ -402,7 +411,15 @@ function runOnce ({
 
   // 模型列表监测与（可选的）指定模型可用性探测并行执行（S5）：
   // 同时启动两条流程，探测不再等待主监测完成，互不阻塞。
-  if (!probeModels.length) return baseline
+  if (!probeModels.length) {
+    // 配置清空全部模型时也必须清理旧状态，避免日后重新启用时沿用旧时间戳。
+    const clearProbeState = probeStore.write([]).catch(error => {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('模型探测状态清理失败:', error && error.message ? error.message : error)
+      }
+    })
+    return Promise.all([baseline, clearProbeState]).then(([result]) => result)
+  }
 
   const probeFlow = (async () => {
     try {
@@ -435,7 +452,8 @@ function runOnce ({
           }
         }
       }
-      await probeStore.write([...committed.values()])
+      // 只持久化当前配置中的模型，移除 probeModels 后的残留状态会在本轮自动清理。
+      await probeStore.write(probeModels.map(model => committed.get(model)).filter(Boolean))
     } catch (error) {
       // 探测失败不应阻断主模型列表监测结果。
       if (typeof console !== 'undefined' && console.error) console.error('模型探测失败:', error && error.message ? error.message : error)

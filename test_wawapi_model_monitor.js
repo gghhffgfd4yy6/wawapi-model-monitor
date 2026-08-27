@@ -707,6 +707,21 @@ async function test (name, fn) {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  await test('清空探测状态失败不阻断主模型监测', async () => {
+    const originalError = console.error
+    console.error = () => {}
+    try {
+      const result = await runOnce({
+        config: { apiKey: 'key', stateFile: '/dev/null/state.json', probeModels: [], probeIntervalMs: 3600000, watchExact: [], watchPrefixes: [] },
+        monitor: async () => ({ outcome: 'unchanged' }),
+        notify: async () => {}
+      })
+      assert.equal(result.outcome, 'unchanged')
+    } finally {
+      console.error = originalError
+    }
+  })
+
   await test('fetchModelProbe HTTP 200 且含内容算可用，否则不可用', async () => {
     const mockRequest = async (url, options) => ({ statusCode: 200, body: JSON.stringify({ model: options.json.model, choices: [{ message: { content: 'hi' } }] }) })
     const ok = await fetchModelProbe({ apiKey: 'key', model: 'm1', request: mockRequest })

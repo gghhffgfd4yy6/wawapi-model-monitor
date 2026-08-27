@@ -91,7 +91,7 @@ async function fetchModelsMulti ({ apiKeys, request = got }) {
   if (errors.length > 0) {
     if (validResponses > 0) {
       const error = monitorError('PARTIAL_API_KEY_FAILURE', `${errors.length}/${apiKeys.length} 个 API Key 请求失败，拒绝使用不完整模型列表`)
-      error.statusCode = errors[0].error.statusCode || null
+      error.statusCode = errors[0].error && errors[0].error.statusCode || null
       throw error
     }
     throw errors[0].error
@@ -161,7 +161,7 @@ async function fetchModelProbe ({ apiKey, model, request = got }) {
     return { ok: false, detail: `HTTP ${res.statusCode}` }
   }
   const body = parseResponseBodySafe(res.body)
-  if (!body || typeof body.model !== 'string' || body.model.trim() !== model) {
+  if (!body || typeof body.model !== 'string' || body.model !== model) {
     const actualModel = body && typeof body.model === 'string' ? body.model.trim() : '缺失'
     return { ok: false, detail: `响应模型不匹配（期望 ${model}，实际 ${actualModel}）` }
   }
@@ -411,7 +411,10 @@ function runOnce ({
 
   // 模型列表监测与（可选的）指定模型可用性探测并行执行（S5）：
   // 同时启动两条流程，探测不再等待主监测完成，互不阻塞。
-  if (!probeModels.length) return baseline
+  if (!probeModels.length) {
+    // 配置清空全部模型时也必须清理旧状态，避免日后重新启用时沿用旧时间戳。
+    return probeStore.write([]).then(() => baseline)
+  }
 
   const probeFlow = (async () => {
     try {

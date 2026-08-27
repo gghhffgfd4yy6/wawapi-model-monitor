@@ -413,7 +413,12 @@ function runOnce ({
   // 同时启动两条流程，探测不再等待主监测完成，互不阻塞。
   if (!probeModels.length) {
     // 配置清空全部模型时也必须清理旧状态，避免日后重新启用时沿用旧时间戳。
-    return probeStore.write([]).then(() => baseline)
+    const clearProbeState = probeStore.write([]).catch(error => {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('模型探测状态清理失败:', error && error.message ? error.message : error)
+      }
+    })
+    return Promise.all([baseline, clearProbeState]).then(([result]) => result)
   }
 
   const probeFlow = (async () => {
